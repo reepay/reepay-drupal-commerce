@@ -1,0 +1,13 @@
+commerce_payment.commerce_payment_gateway.plugin.reepay_checkout:
+  type: commerce_payment_gateway_configuration
+  mapping:
+    mapping:
+      live_private_key:
+        type: string
+        label: 'Live Private Key'
+      test_private_key:
+        type: string
+        label: 'Test Private Key'
+      checkout_type:
+        type: select
+        label: 'Checkout type'

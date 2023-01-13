@@ -1,0 +1,10 @@
+{
+    "name": "drupal/commerce_reepay",
+    "type": "drupal-module",
+    "description": "Provides Commerce integration for Reepay.",
+    "homepage": "http://drupal.org/project/commerce_reepay",
+    "license": "GPL-2.0-or-later",
+    "require": {
+        "drupal/commerce": "^2.25 || ^3"
+    }
+}

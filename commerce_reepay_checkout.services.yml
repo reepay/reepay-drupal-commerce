@@ -1,0 +1,4 @@
+services:
+  commerce_reepay_checkout.reepay_service:
+    class: Drupal\commerce_reepay_checkout\Services\ReepayService
+    arguments: ['@logger.factory']

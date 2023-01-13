@@ -1,0 +1,6 @@
+commerce_reepay_checkout.payment:
+  js:
+    https://checkout.reepay.com/checkout.js: {type: external}
+    js/commerce_reepay_checkout.js: {}
+  dependencies:
+    - core/jquery
