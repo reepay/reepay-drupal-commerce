@@ -185,6 +185,7 @@ final class Reepay extends OffsitePaymentGatewayBase implements SupportsRefundsI
         'dankort' => t('Dankort'),
         'visa' => t('VISA'),
         'visa_elec' => t('VISA Electron'),
+	'anyday'    => t('Anyday'), 
 
         'mc'  => t('MasterCard'),
         'amex' => t('American Express'),
