@@ -27,12 +27,12 @@ use Symfony\Component\EventDispatcher\EventDispatcherInterface;
 use Symfony\Component\HttpFoundation\Request;
 
 /**
- * Reepay Checkout Commerce Payment Gateway.
+ * Billwerk+ Payments Payment Gateway.
  *
  * @CommercePaymentGateway(
  *   id = "reepay_checkout",
- *   label = @Translation("Reepay Checkout"),
- *   display_label = @Translation("Reepay Checkout"),
+ *   label = @Translation("Billwerk+ Payments"),
+ *   display_label = @Translation("Billwerk+ Payments"),
  *   forms = {
  *     "offsite-payment" = "Drupal\commerce_reepay_checkout\PluginForm\ReepayOffsiteRedirectForm",
  *    },
@@ -56,7 +56,7 @@ final class Reepay extends OffsitePaymentGatewayBase implements SupportsRefundsI
   private $eventDispatcher;
 
   /**
-   * Reepay constructor.
+   * Billwerk+ Payments constructor.
    *
    * @param array $configuration
    *   Plugin configuration.
@@ -130,7 +130,7 @@ final class Reepay extends OffsitePaymentGatewayBase implements SupportsRefundsI
     $form['live_private_key'] = [
       '#type' => 'textfield',
       '#title' => $this->t('Live Private key'),
-      '#description' => $this->t('This is the private key from the Reepay admin.'),
+      '#description' => $this->t('This is the private key from the Billwerk+ Payments admin.'),
       '#default_value' => $this->configuration['live_private_key'],
       '#required' => TRUE,
     ];
@@ -138,7 +138,7 @@ final class Reepay extends OffsitePaymentGatewayBase implements SupportsRefundsI
     $form['test_private_key'] = [
       '#type' => 'textfield',
       '#title' => $this->t('Test Private key'),
-      '#description' => $this->t('This is the private key from the Reepay admin.'),
+      '#description' => $this->t('This is the private key from the Billwerk+ Payments admin.'),
       '#default_value' => $this->configuration['test_private_key'],
       '#required' => TRUE,
     ];
@@ -185,7 +185,7 @@ final class Reepay extends OffsitePaymentGatewayBase implements SupportsRefundsI
         'dankort' => t('Dankort'),
         'visa' => t('VISA'),
         'visa_elec' => t('VISA Electron'),
-	'anyday'    => t('Anyday'), 
+	'anyday'    => t('Anyday'),
 
         'mc'  => t('MasterCard'),
         'amex' => t('American Express'),
@@ -355,7 +355,7 @@ final class Reepay extends OffsitePaymentGatewayBase implements SupportsRefundsI
     $result = $this->reepayService->updateWebhook($notifyUrl);
 
     if($result['saved'] == 'yes' ) {
-       $this->messenger()->addMessage( 'Webhook was successfully saved in Reepay admin' );
+       $this->messenger()->addMessage( 'Webhook was successfully saved in Billwerk+ Payments admin' );
     }
   }
 

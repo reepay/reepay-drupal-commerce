@@ -1,5 +1,5 @@
-name: "Commerce Reepay"
-description: "Payment module for Drupal commerce that integrates Reepay payment gateway"
+name: "Billwerk+ Payments"
+description: "Payment module for Drupal commerce that integrates Billwerk+ Payments gateway"
 package: "Commerce Payment"
 dependencies:
   - commerce:commerce_payment
@@ -7,6 +7,6 @@ type: module
 core_version_requirement: ^8 || ^9 || ^10
 
 # Information added by Drupal.org packaging script on 2023-01-13
-version: '1.0.1'
+version: '1.0.4'
 project: 'commerce_reepay'
 datestamp: 1673623665

@@ -98,7 +98,7 @@ class ReepayOffsiteRedirectForm extends PaymentOffsiteForm implements ContainerI
     $result = $this->reepayService->createChargeSession($payload);
 
     if($result['result'] == 'error') {
-        throw new PaymentGatewayException( t('Error occurred during payment with Reepay checkout'));
+        throw new PaymentGatewayException( t('Error occurred during payment with Billwerk+ Payments checkout'));
     }
 
     $checkout_type = $configuration['checkout_type'];

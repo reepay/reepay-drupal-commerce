@@ -1,7 +1,7 @@
 {
     "name": "drupal/commerce_reepay",
     "type": "drupal-module",
-    "description": "Provides Commerce integration for Reepay.",
+    "description": "Provides Commerce integration for Billwerk+ Payments.",
     "homepage": "http://drupal.org/project/commerce_reepay",
     "license": "GPL-2.0-or-later",
     "require": {
