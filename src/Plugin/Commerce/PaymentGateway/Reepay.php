@@ -27,12 +27,12 @@ use Symfony\Component\EventDispatcher\EventDispatcherInterface;
 use Symfony\Component\HttpFoundation\Request;
 
 /**
- * Billwerk+ Payments Payment Gateway.
+ * Frisbii Payments Payment Gateway.
  *
  * @CommercePaymentGateway(
  *   id = "reepay_checkout",
- *   label = @Translation("Billwerk+ Payments"),
- *   display_label = @Translation("Billwerk+ Payments"),
+ *   label = @Translation("Frisbii Payments"),
+ *   display_label = @Translation("Frisbii Payments"),
  *   forms = {
  *     "offsite-payment" = "Drupal\commerce_reepay_checkout\PluginForm\ReepayOffsiteRedirectForm",
  *    },
@@ -56,7 +56,7 @@ final class Reepay extends OffsitePaymentGatewayBase implements SupportsRefundsI
   private $eventDispatcher;
 
   /**
-   * Billwerk+ Payments constructor.
+   * Frisbii Payments constructor.
    *
    * @param array $configuration
    *   Plugin configuration.
@@ -130,7 +130,7 @@ final class Reepay extends OffsitePaymentGatewayBase implements SupportsRefundsI
     $form['live_private_key'] = [
       '#type' => 'textfield',
       '#title' => $this->t('Live Private key'),
-      '#description' => $this->t('This is the private key from the Billwerk+ Payments admin.'),
+      '#description' => $this->t('This is the private key from the Frisbii Payments admin.'),
       '#default_value' => $this->configuration['live_private_key'],
       '#required' => TRUE,
     ];
@@ -138,7 +138,7 @@ final class Reepay extends OffsitePaymentGatewayBase implements SupportsRefundsI
     $form['test_private_key'] = [
       '#type' => 'textfield',
       '#title' => $this->t('Test Private key'),
-      '#description' => $this->t('This is the private key from the Billwerk+ Payments admin.'),
+      '#description' => $this->t('This is the private key from the Frisbii Payments admin.'),
       '#default_value' => $this->configuration['test_private_key'],
       '#required' => TRUE,
     ];
@@ -355,7 +355,7 @@ final class Reepay extends OffsitePaymentGatewayBase implements SupportsRefundsI
     $result = $this->reepayService->updateWebhook($notifyUrl);
 
     if($result['saved'] == 'yes' ) {
-       $this->messenger()->addMessage( 'Webhook was successfully saved in Billwerk+ Payments admin' );
+       $this->messenger()->addMessage( 'Webhook was successfully saved in Frisbii Payments admin' );
     }
   }
 

@@ -1,5 +1,5 @@
-name: "Billwerk+ Payments"
-description: "Payment module for Drupal commerce that integrates Billwerk+ Payments gateway"
+name: "Frisbii Payments"
+description: "Payment module for Drupal commerce that integrates Frisbii Payments gateway"
 package: "Commerce Payment"
 dependencies:
   - commerce:commerce_payment
