@@ -7,18 +7,13 @@ use Drupal\commerce_order\Entity\OrderInterface;
 use Drupal\commerce_order\Event\OrderEvent;
 use Drupal\commerce_payment\Entity\PaymentInterface;
 use Drupal\commerce_payment\Exception\InvalidRequestException;
-use Drupal\commerce_payment\PaymentMethodTypeManager;
-use Drupal\commerce_payment\PaymentTypeManager;
 use Drupal\commerce_payment\Plugin\Commerce\PaymentGateway\OffsitePaymentGatewayBase;
 use Drupal\commerce_payment\Plugin\Commerce\PaymentGateway\SupportsAuthorizationsInterface;
 use Drupal\commerce_payment\Plugin\Commerce\PaymentGateway\SupportsNotificationsInterface;
 use Drupal\commerce_payment\Plugin\Commerce\PaymentGateway\SupportsRefundsInterface;
-use Drupal\commerce_price\MinorUnitsConverterInterface;
 use Drupal\commerce_price\Price;
 use Drupal\commerce_reepay_checkout\Services\ReepayService;
-use Drupal\Component\Datetime\TimeInterface;
 use Drupal\Component\Serialization\Json;
-use Drupal\Core\Entity\EntityTypeManagerInterface;
 use Drupal\Core\Form\FormStateInterface;
 use Drupal\Core\Url;
 use Drupal\language\ConfigurableLanguageManagerInterface;
@@ -56,62 +51,15 @@ final class Reepay extends OffsitePaymentGatewayBase implements SupportsRefundsI
   private $eventDispatcher;
 
   /**
-   * Frisbii Payments constructor.
-   *
-   * @param array $configuration
-   *   Plugin configuration.
-   * @param string $plugin_id
-   *   Plugin id.
-   * @param mixed $plugin_definition
-   *   Plugin definition.
-   * @param \Drupal\Core\Entity\EntityTypeManagerInterface $entity_type_manager
-   *   Entity Type Manager Service.
-   * @param \Drupal\commerce_payment\PaymentTypeManager $payment_type_manager
-   *   Payment Type Manager.
-   * @param \Drupal\commerce_payment\PaymentMethodTypeManager $payment_method_type_manager
-   *   Payment Method Type Manager.
-   * @param \Drupal\Component\Datetime\TimeInterface $time
-   *   Time Service.
-   * @param \Drupal\Core\Language\LanguageManager $languageManager
-   *   LanguageManager Service.
-   * @param \Drupal\Core\Config\ConfigFactory $configFactory
-   *   The Config Factory Service.
+   * {@inheritdoc}
    */
-  public function __construct(array $configuration,
-                              $plugin_id, $plugin_definition,
-                              EntityTypeManagerInterface $entity_type_manager,
-                              PaymentTypeManager $payment_type_manager,
-                              PaymentMethodTypeManager $payment_method_type_manager,
-                              TimeInterface $time,
-                              MinorUnitsConverterInterface $minor_units_converter = NULL,
-                              ReepayService $reepayService, EventDispatcherInterface $event_dispatcher)
-  {
-    parent::__construct($configuration,
-                        $plugin_id,
-                        $plugin_definition,
-                        $entity_type_manager,
-                        $payment_type_manager,
-                        $payment_method_type_manager,
-                        $time,
-                        $minor_units_converter);
-
-    $this->reepayService = $reepayService;
-    $this->eventDispatcher = $event_dispatcher;
-  }
-
   public static function create(ContainerInterface $container, array $configuration, $plugin_id, $plugin_definition) {
-    return new static(
-      $configuration,
-      $plugin_id,
-      $plugin_definition,
-      $container->get('entity_type.manager'),
-      $container->get('plugin.manager.commerce_payment_type'),
-      $container->get('plugin.manager.commerce_payment_method_type'),
-      $container->get('datetime.time'),
-      $container->get('commerce_price.minor_units_converter'),
-      $container->get('commerce_reepay_checkout.reepay_service'),
-      $container->get('event_dispatcher')
-    );
+    /** @var static $instance */
+    $instance = parent::create($container, $configuration, $plugin_id, $plugin_definition);
+    $instance->reepayService = $container->get('commerce_reepay_checkout.reepay_service');
+    $instance->eventDispatcher = $container->get('event_dispatcher');
+
+    return $instance;
   }
 
   public function defaultConfiguration() {
@@ -258,7 +206,6 @@ final class Reepay extends OffsitePaymentGatewayBase implements SupportsRefundsI
            $state = ($invoice['state'] == 'authorized') ? 'authorization' : 'completed';
            $payment->set('state', $state);
            $payment->set('amount', $order->getTotalPrice());
-           $payment->set('payment_gateway', 'reepay_checkout');
            $payment->set('order_id', $order->id());
            $payment->set('test', $configuration['mode'] == 'test');
            $payment->set('remote_id', $request->get('invoice'));
@@ -313,7 +260,6 @@ final class Reepay extends OffsitePaymentGatewayBase implements SupportsRefundsI
           $state = ($invoice['state'] == 'authorized') ? 'authorization' : 'completed';
           $payment->set('state', $state);
           $payment->set('amount', $order->getTotalPrice());
-          $payment->set('payment_gateway', 'reepay_checkout');
           $payment->set('order_id', $order->id());
           $payment->set('test', $configuration['mode'] == 'test');
           $payment->set('remote_id', $decoded_result['invoice']);
@@ -359,7 +305,7 @@ final class Reepay extends OffsitePaymentGatewayBase implements SupportsRefundsI
     }
   }
 
-  public function capturePayment(PaymentInterface $payment, Price $amount = NULL)
+  public function capturePayment(PaymentInterface $payment, ?Price $amount = NULL)
   {
     $paymentAmount = (int) $amount->getNumber() * 100;
     $configuration = $payment->getPaymentGateway()->getPlugin()->getConfiguration();
@@ -382,7 +328,7 @@ final class Reepay extends OffsitePaymentGatewayBase implements SupportsRefundsI
     }
   }
 
-  public function refundPayment(PaymentInterface $payment, Price $amount = NULL)
+  public function refundPayment(PaymentInterface $payment, ?Price $amount = NULL)
   {
     $this->assertPaymentState($payment, ['completed', 'partially_refunded']);
 
