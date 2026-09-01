@@ -4,4 +4,4 @@ package: "Commerce Payment"
 dependencies:
   - commerce:commerce_payment
 type: module
-core_version_requirement: ^8 || ^9 || ^10
+core_version_requirement: ^8 || ^9 || ^10 || ^11
