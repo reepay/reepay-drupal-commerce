@@ -1,13 +1,4 @@
-# Frisbii Payments payment module for Drupal Commerce
-This module is aimed to provide online payments with Frisbii Payments payment gateway
-
-# Installation
-To install the module with composer go to Drupal repository : https://www.drupal.org/project/commerce_reepay
-
-# Requirements
-The module works with Drupal versions >=8
-
-## Changelog (Latest Release)
+## Changelog
 v 1.0.5
 - [Fix] - Added support for Drupal 11 by widening core_version_requirement to include ^11.
 - [Fix] - Fixed PHP 8.4 implicit-nullable deprecation warnings by updating capturePayment() and refundPayment() method signatures to use explicit nullable type hints (?Price).
