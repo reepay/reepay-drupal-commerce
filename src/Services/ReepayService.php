@@ -3,14 +3,27 @@
 namespace Drupal\commerce_reepay_checkout\Services;
 
 use GuzzleHttp\Client;
+use GuzzleHttp\ClientInterface;
+use Drupal\Component\Datetime\TimeInterface;
 use Drupal\Component\Serialization\Json;
 use GuzzleHttp\Exception\ClientException;
+use Drupal\Core\Cache\CacheBackendInterface;
 use Drupal\Core\Logger\LoggerChannelFactoryInterface;
 
 class ReepayService
 {
+  /**
+   * How long the webhook secret may be cached, in seconds.
+   */
+  const WEBHOOK_SECRET_CACHE_TTL = 600;
+
+  /**
+   * The cache ID prefix used to store the webhook secret.
+   */
+  const WEBHOOK_SECRET_CACHE_ID_PREFIX = 'commerce_reepay_checkout:webhook_secret:';
+
    /**
-   * @var Client
+   * @var ClientInterface
    */
    private $client;
 
@@ -20,16 +33,31 @@ class ReepayService
    private $logger;
 
   /**
+   * @var CacheBackendInterface
+   */
+   private $cache;
+
+  /**
+   * @var TimeInterface
+   */
+   private $time;
+
+  /**
    * @var array
    */
    private $payload;
 
   /**
    * @param LoggerChannelFactoryInterface $loggerChannelFactory
+   * @param CacheBackendInterface $cache
+   * @param TimeInterface $time
+   * @param ClientInterface|null $client
    */
-   public function __construct(LoggerChannelFactoryInterface $loggerChannelFactory) {
+   public function __construct(LoggerChannelFactoryInterface $loggerChannelFactory, CacheBackendInterface $cache, TimeInterface $time, ?ClientInterface $client = NULL) {
       $this->logger = $loggerChannelFactory->get('commerce_reepay_checkout');
-      $this->client = new Client();
+      $this->cache = $cache;
+      $this->time = $time;
+      $this->client = $client ?: new Client();
       $this->payload['headers'] = [
         'Accept' => 'application/json',
         'Content-Type' => 'application/json'
@@ -114,6 +142,90 @@ class ReepayService
          return ['resul' => 'error', 'message' => $e->getMessage()];
     }
 
+  }
+
+  /**
+   * Retrieves the webhook secret, using a short-lived cache.
+   *
+   * @param bool $forceRefresh
+   *   Bypass the cache and fetch a fresh secret from Frisbii.
+   *
+   * @return string|null
+   *   The webhook secret, or NULL when it could not be retrieved.
+   */
+  public function getWebhookSecret(bool $forceRefresh = FALSE): ?string
+  {
+    $cacheId = $this->getWebhookSecretCacheId();
+
+    if (!$forceRefresh) {
+      $cached = $this->cache->get($cacheId);
+      if ($cached && !empty($cached->data)) {
+        return $cached->data;
+      }
+    }
+
+    try {
+      $result = $this->client->request('GET', 'https://api.reepay.com/v1/account/webhook_settings', $this->payload);
+      $result_decoded = Json::decode($result->getBody());
+    } catch (\Exception $e) {
+      $this->logger->error('Could not retrieve webhook settings: @message', ['@message' => $e->getMessage()]);
+      return NULL;
+    }
+
+    if (empty($result_decoded['secret'])) {
+      $this->logger->error('Webhook settings response did not contain a secret.');
+      return NULL;
+    }
+
+    $this->cache->set($cacheId, $result_decoded['secret'], $this->time->getRequestTime() + self::WEBHOOK_SECRET_CACHE_TTL);
+
+    return $result_decoded['secret'];
+  }
+
+  /**
+   * Invalidates the cached webhook secret.
+   */
+  public function invalidateWebhookSecret(): void
+  {
+    $this->cache->delete($this->getWebhookSecretCacheId());
+  }
+
+  /**
+   * Builds the cache ID for the webhook secret of the currently set key.
+   */
+  private function getWebhookSecretCacheId(): string
+  {
+    $authorization = $this->payload['headers']['Authorization'] ?? '';
+    return self::WEBHOOK_SECRET_CACHE_ID_PREFIX . hash('sha256', $authorization);
+  }
+
+  /**
+   * Writes a non-sensitive trace line for the webhook flow.
+   *
+   * Never pass the private key, webhook secret, raw signature, or full
+   * request payload here.
+   *
+   * @param string $message
+   *   The log message, with @placeholder tokens.
+   * @param array $context
+   *   Values for the message's @placeholder tokens.
+   * @param string $level
+   *   One of 'info', 'warning' or 'error'.
+   */
+  public function logWebhookEvent(string $message, array $context = [], string $level = 'info'): void
+  {
+    switch ($level) {
+      case 'warning':
+        $this->logger->warning($message, $context);
+        break;
+
+      case 'error':
+        $this->logger->error($message, $context);
+        break;
+
+      default:
+        $this->logger->info($message, $context);
+    }
   }
 
   public function updateWebhook(string $notifyUrl)
