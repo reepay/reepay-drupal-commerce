@@ -24,6 +24,12 @@ use Drupal\Core\Form\FormStateInterface;
 final class Reepay extends ReepayGatewayBase
 {
 
+  public function defaultConfiguration() {
+    return [
+        'payment_method' => [],
+      ] + parent::defaultConfiguration();
+  }
+
   public function buildConfigurationForm(array $form, FormStateInterface $form_state) {
 
     $form = parent::buildConfigurationForm($form, $form_state);

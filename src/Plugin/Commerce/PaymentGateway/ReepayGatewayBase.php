@@ -72,6 +72,7 @@ abstract class ReepayGatewayBase extends OffsitePaymentGatewayBase implements Su
         'live_private_key' => '',
         'test_private_key' => '',
         'checkout_type' => 'window',
+        'locale' => 'en_US',
         'instant_settle' => 'no'
       ] + parent::defaultConfiguration();
   }
