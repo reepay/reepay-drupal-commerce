@@ -69,11 +69,8 @@ class ReepayOffsiteRedirectForm extends PaymentOffsiteForm implements ContainerI
 
     $address = $order->getBillingProfile()->address->first();
 
-    $payment_methods = [];
-
-    foreach($configuration['payment_method'] as $key => $value) {
-      $payment_methods[] = $key;
-    }
+    $paymentGatewayPlugin = $payment->getPaymentGateway()->getPlugin();
+    $payment_methods = $paymentGatewayPlugin->getReepayPaymentMethods();
 
     $payload = ['order' =>
                  ['handle' => $invoiceHandle,

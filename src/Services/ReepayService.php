@@ -70,6 +70,8 @@ class ReepayService
 
    public function createChargeSession(array $payload) {
        try {
+            $this->logger->info('Create charge session payload: @payload', ['@payload' => Json::encode($payload)]);
+
             $this->payload['body'] = Json::encode($payload);
             $this->payload['headers']['User-Agent'] = 'drupal_commerce/1.0.0';
             $response = $this->client->post('https://checkout-api.reepay.com/v1/session/charge', $this->payload);
