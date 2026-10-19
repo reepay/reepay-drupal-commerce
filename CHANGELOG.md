@@ -1,5 +1,6 @@
 ## Changelog
 [Unrelease]
+- [Feature] - Click to Pay: the General payment method (Reepay) now appends "click_to_pay" (once) to the session's payment_methods when "visa", "mc" or "card" is selected. No new setting; the merchant is enabled through Frisbii admin.
 - [Feature] - Added Klarna as a new payment method: selectable in the General payment method's (Reepay) payment_method list, and as a new dedicated single-payment-method gateway (Klarna, id=reepay_klarna) that always sends payment_methods=["klarna"] to the Frisbii API, including for the checkout session's own webhook registration.
 - [Improvement] - Extracted the credentials, checkout-session return/notify handling (incl. webhook signature verification), and capture/refund/void logic shared by all Frisbii gateways out of Reepay into a new abstract ReepayGatewayBase, so additional single-payment-method gateways don't duplicate that logic.
 - [Improvement] - ReepayOffsiteRedirectForm now resolves the payment_methods value to send via the gateway plugin's getReepayPaymentMethods(), instead of reading the General payment method's configuration directly, so the same form works for both gateway types.

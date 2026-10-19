@@ -100,7 +100,15 @@ final class Reepay extends ReepayGatewayBase
    * {@inheritdoc}
    */
   public function getReepayPaymentMethods(): array {
-    return array_keys(array_filter($this->configuration['payment_method'] ?? []));
+    $methods = array_keys(array_filter($this->configuration['payment_method'] ?? []));
+
+    // Click to Pay is not a separate method: it is enabled by adding
+    // "click_to_pay" next to a card method. Add it only once.
+    if (array_intersect(['visa', 'mc', 'card'], $methods)) {
+      $methods[] = 'click_to_pay';
+    }
+
+    return $methods;
   }
 
 }
