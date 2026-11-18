@@ -1,4 +1,10 @@
 ## Changelog
+v 1.1.0
+- [Fix] - Payment improvements.
+- [Fix] - Frisbii webhook authentication with HMAC-SHA256
+- [Feature] - Supports Visa & Mastercard Click-to-pay.
+- [Feature] - Support new Klarna payment option for all previous Klarna options.
+
 v 1.0.5
 - [Fix] - Added support for Drupal 11 by widening core_version_requirement to include ^11.
 - [Fix] - Fixed PHP 8.4 implicit-nullable deprecation warnings by updating capturePayment() and refundPayment() method signatures to use explicit nullable type hints (?Price).
