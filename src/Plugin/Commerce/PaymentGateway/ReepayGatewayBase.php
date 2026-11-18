@@ -159,7 +159,7 @@ abstract class ReepayGatewayBase extends OffsitePaymentGatewayBase implements Su
       throw new PaymentGatewayException('No payment was found for this order.');
     }
 
-    $payment = current($payments);
+    $payment = $this->selectPayment($payments);
     $configuration = $payment->getPaymentGateway()->getPlugin()->getConfiguration();
 
     if('test' == $configuration['mode']) {
@@ -286,7 +286,7 @@ abstract class ReepayGatewayBase extends OffsitePaymentGatewayBase implements Su
       ], 'warning');
       return new Response();
     }
-    $payment = current($payments);
+    $payment = $this->selectPayment($payments);
 
     $invoiceData = $this->reepayService->getInvoice($invoice);
     $invoiceState = is_array($invoiceData) ? ($invoiceData['state'] ?? NULL) : NULL;
@@ -329,6 +329,27 @@ abstract class ReepayGatewayBase extends OffsitePaymentGatewayBase implements Su
     ]);
 
     return new Response();
+  }
+
+  /**
+   * Picks which payment to confirm, when an order has more than one.
+   *
+   * ReepayOffsiteRedirectForm can leave behind more than one "new" payment
+   * for the same order (one per payment-page build). Prefer the most
+   * recently created payment still in state "new" — the one the customer
+   * actually just paid through — over whatever loadByProperties() happens
+   * to return first.
+   *
+   * @param \Drupal\commerce_payment\Entity\PaymentInterface[] $payments
+   *   Payments for one order, as returned by loadByProperties(). Must be
+   *   non-empty.
+   */
+  private function selectPayment(array $payments): PaymentInterface {
+    ksort($payments);
+    $new_payments = array_filter($payments, function (PaymentInterface $payment) {
+      return $payment->getState()->getId() === 'new';
+    });
+    return end($new_payments) ?: end($payments);
   }
 
   /**

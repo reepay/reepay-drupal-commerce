@@ -323,7 +323,11 @@ class ReepayOnNotifyTest extends UnitTestCase {
     $orderStorage = $this->createMock(EntityStorageInterface::class);
     $orderStorage->method('load')->willReturn($order);
 
+    $paymentState = $this->createMock(StateItemInterface::class);
+    $paymentState->method('getId')->willReturn('new');
+
     $payment = $this->createMock(PaymentInterface::class);
+    $payment->method('getState')->willReturn($paymentState);
     $payment->expects($this->never())->method('save');
     $paymentStorage = $this->createMock(EntityStorageInterface::class);
     $paymentStorage->method('loadByProperties')->willReturn($withPayment ? [$payment] : []);
@@ -352,6 +356,71 @@ class ReepayOnNotifyTest extends UnitTestCase {
   public function testMissingPaymentEntityDoesNotPlaceOrder(): void {
     [$gateway] = $this->notifyGatewayForUnplacedOrder(['state' => 'settled'], FALSE, 17, FALSE);
     $response = $gateway->onNotify($this->request($this->signedPayload()));
+    $this->assertTrue($response->isSuccessful());
+  }
+
+  /**
+   * When an order ended up with more than one "new" payment (left behind by
+   * repeated payment-page builds before the FD-11 fix, or simply not yet
+   * cleaned up), onNotify() must confirm the most recently created "new"
+   * one, not whichever loadByProperties() happens to return first.
+   */
+  public function testMultiplePaymentsPicksMostRecentNewOne(): void {
+    $payload = $this->signedPayload(['event_type' => 'invoice_authorized', 'invoice' => '17']);
+
+    $reepayService = $this->createReepayServiceMock();
+    $reepayService->method('getWebhookSecret')->willReturn(self::SECRET);
+    $reepayService->method('getInvoice')->with('17')->willReturn(['state' => 'authorized']);
+
+    $orderState = $this->createMock(StateItemInterface::class);
+    $order = $this->createMock(OrderInterface::class);
+    $order->method('get')->willReturnMap([
+      ['checkout_step', (object) ['value' => 'payment']],
+      ['state', (object) ['value' => 'draft']],
+    ]);
+    $order->method('getState')->willReturn($orderState);
+    $order->method('getTotalPrice')->willReturn(NULL);
+    $order->method('id')->willReturn(17);
+
+    $orderStorage = $this->createMock(EntityStorageInterface::class);
+    $orderStorage->method('load')->with('17')->willReturn($order);
+
+    $transition = $this->createMock(WorkflowTransition::class);
+    $workflow = $this->createMock(WorkflowInterface::class);
+    $workflow->method('getTransition')->with('authorize')->willReturn($transition);
+
+    // An older "new" payment (lower entity id) that must NOT be touched.
+    $staleState = $this->createMock(StateItemInterface::class);
+    $staleState->method('getId')->willReturn('new');
+    $stalePayment = $this->createMock(PaymentInterface::class);
+    $stalePayment->method('getState')->willReturn($staleState);
+    $stalePayment->expects($this->never())->method('save');
+
+    // The most recently created "new" payment (higher entity id) — the one
+    // actually used for the checkout attempt being confirmed now.
+    $recentState = $this->createMock(StateItemInterface::class);
+    $recentState->method('getId')->willReturn('new');
+    $recentState->method('getWorkflow')->willReturn($workflow);
+    $recentState->expects($this->once())->method('applyTransition')->with($transition);
+    $recentPayment = $this->createMock(PaymentInterface::class);
+    $recentPayment->method('getState')->willReturn($recentState);
+    $recentPayment->expects($this->once())->method('save');
+
+    $paymentStorage = $this->createMock(EntityStorageInterface::class);
+    // Deliberately returned with the stale payment first, keyed by a lower
+    // entity id, to prove the selection does not just take current().
+    $paymentStorage->method('loadByProperties')->with(['order_id' => '17'])
+      ->willReturn([5 => $stalePayment, 9 => $recentPayment]);
+
+    $entityTypeManager = $this->createMock(EntityTypeManagerInterface::class);
+    $entityTypeManager->method('getStorage')->willReturnMap([
+      ['commerce_order', $orderStorage],
+      ['commerce_payment', $paymentStorage],
+    ]);
+
+    $gateway = $this->createGateway($reepayService, $entityTypeManager);
+    $response = $gateway->onNotify($this->request($payload));
+
     $this->assertTrue($response->isSuccessful());
   }
 
