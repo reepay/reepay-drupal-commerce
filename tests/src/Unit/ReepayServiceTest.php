@@ -121,6 +121,112 @@ class ReepayServiceTest extends UnitTestCase {
     $service->invalidateWebhookSecret();
   }
 
+  /**
+   * No cooldown active: the secret is invalidated and refetched, and the
+   * cooldown is recorded so the next mismatch does not repeat this.
+   */
+  public function testRefreshWebhookSecretOncePerCooldownRefreshesWhenNoCooldownIsActive(): void {
+    $client = $this->createMock(ClientInterface::class);
+    $client->expects($this->once())
+      ->method('request')
+      ->willReturn(new GuzzleResponse(200, [], json_encode(['secret' => 'rotated-secret'])));
+
+    $cache = $this->createMock(CacheBackendInterface::class);
+    $cache->method('get')->willReturn(FALSE);
+    $cache->expects($this->exactly(2))->method('set')
+      ->with($this->isType('string'), $this->anything(), $this->isType('int'));
+    $cache->expects($this->once())->method('delete')->with($this->isType('string'));
+
+    $service = $this->createService($client, $cache, 1000000);
+
+    $this->assertSame('rotated-secret', $service->refreshWebhookSecretOncePerCooldown());
+  }
+
+  /**
+   * A cooldown already recorded: no cache write, no delete, no HTTP call —
+   * repeated bad signatures cannot force unlimited refreshes.
+   */
+  public function testRefreshWebhookSecretOncePerCooldownDoesNothingWhileCooldownIsActive(): void {
+    $client = $this->createMock(ClientInterface::class);
+    $client->expects($this->never())->method('request');
+
+    $cache = $this->createMock(CacheBackendInterface::class);
+    $cache->method('get')->willReturn((object) ['data' => TRUE]);
+    $cache->expects($this->never())->method('set');
+    $cache->expects($this->never())->method('delete');
+
+    $service = $this->createService($client, $cache);
+
+    $this->assertNull($service->refreshWebhookSecretOncePerCooldown());
+  }
+
+  /**
+   * The outgoing payload keeps the customer and billing_address, but the
+   * copy written to the log has both replaced, since name/email/address
+   * has no place accumulating in watchdog.
+   */
+  public function testCreateChargeSessionRedactsCustomerDataFromTheLogOnly(): void {
+    $payload = [
+      'order' => [
+        'handle' => '42',
+        'amount' => 3999,
+        'currency' => 'USD',
+        'customer' => ['first_name' => 'Jane', 'email' => 'jane@example.com'],
+        'billing_address' => ['first_name' => 'Jane', 'address' => 'Street 1'],
+      ],
+    ];
+
+    $sentBody = NULL;
+    $client = new class($sentBody) implements ClientInterface {
+      private $sentBodyRef;
+      public function __construct(&$sentBodyRef) {
+        $this->sentBodyRef = &$sentBodyRef;
+      }
+      public function post($uri, array $options = []) {
+        $this->sentBodyRef = $options['body'] ?? NULL;
+        return new GuzzleResponse(200, [], json_encode(['id' => 'cs_123']));
+      }
+      public function send(\Psr\Http\Message\RequestInterface $request, array $options = []): \Psr\Http\Message\ResponseInterface {
+        throw new \LogicException('Not used by this test.');
+      }
+      public function sendAsync(\Psr\Http\Message\RequestInterface $request, array $options = []): \GuzzleHttp\Promise\PromiseInterface {
+        throw new \LogicException('Not used by this test.');
+      }
+      public function request(string $method, $uri, array $options = []): \Psr\Http\Message\ResponseInterface {
+        throw new \LogicException('Not used by this test.');
+      }
+      public function requestAsync(string $method, $uri, array $options = []): \GuzzleHttp\Promise\PromiseInterface {
+        throw new \LogicException('Not used by this test.');
+      }
+      public function getConfig(?string $option = NULL): void {
+        throw new \LogicException('Not used by this test.');
+      }
+    };
+
+    $channel = $this->createMock(LoggerChannelInterface::class);
+    $loggedPayload = NULL;
+    $channel->expects($this->once())->method('info')->willReturnCallback(function ($message, $context) use (&$loggedPayload) {
+      $loggedPayload = json_decode($context['@payload'], TRUE);
+    });
+    $loggerFactory = $this->createMock(LoggerChannelFactoryInterface::class);
+    $loggerFactory->method('get')->willReturn($channel);
+
+    $time = $this->createMock(TimeInterface::class);
+    $service = new ReepayService($loggerFactory, $this->createMock(CacheBackendInterface::class), $time, $client);
+
+    $result = $service->createChargeSession($payload);
+
+    $this->assertSame('success', $result['result']);
+    $this->assertSame('[redacted]', $loggedPayload['order']['customer']);
+    $this->assertSame('[redacted]', $loggedPayload['order']['billing_address']);
+    $this->assertSame(3999, $loggedPayload['order']['amount']);
+    $this->assertSame('USD', $loggedPayload['order']['currency']);
+
+    $sentPayload = json_decode($sentBody, TRUE);
+    $this->assertSame('Jane', $sentPayload['order']['customer']['first_name']);
+    $this->assertSame('Street 1', $sentPayload['order']['billing_address']['address']);
+  }
+
   public static function minorUnitsProvider(): array {
     return [
       'whole amount' => ['39.00', 'USD', 2, 3900],

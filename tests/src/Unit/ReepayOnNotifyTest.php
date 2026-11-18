@@ -3,6 +3,7 @@
 namespace Drupal\Tests\commerce_reepay_checkout\Unit;
 
 use Drupal\commerce_order\Entity\OrderInterface;
+use Drupal\commerce_payment\Entity\PaymentGatewayInterface;
 use Drupal\commerce_payment\Entity\PaymentInterface;
 use Drupal\commerce_price\Entity\CurrencyInterface;
 use Drupal\commerce_price\Price;
@@ -28,13 +29,20 @@ class ReepayOnNotifyTest extends UnitTestCase {
   private const SECRET = 'whsec_test_secret';
 
   /**
+   * The payment gateway config entity ID used by createGateway()'s mock
+   * $this->parentEntity, and expected in the 'payment_gateway' property of
+   * every commerce_payment loaded by onNotify().
+   */
+  private const GATEWAY_ID = 'frisbii_pay';
+
+  /**
    * Builds a Reepay gateway plugin instance with mocked collaborators.
    *
    * The 15-second delay at the top of onNotify() is stubbed out so tests
    * run instantly; every other collaborator is injected via reflection
    * since the plugin has no public setters for them.
    */
-  private function createGateway(ReepayService $reepayService, ?EntityTypeManagerInterface $entityTypeManager = NULL, ?EventDispatcherInterface $eventDispatcher = NULL): ReepayGatewayBase {
+  private function createGateway(ReepayService $reepayService, ?EntityTypeManagerInterface $entityTypeManager = NULL, ?EventDispatcherInterface $eventDispatcher = NULL, ?string $gatewayId = self::GATEWAY_ID): ReepayGatewayBase {
     $configuration = [
       'mode' => 'test',
       'test_private_key' => 'test-key',
@@ -54,6 +62,15 @@ class ReepayOnNotifyTest extends UnitTestCase {
     $this->setInaccessibleProperty($gateway, 'entityTypeManager', $entityTypeManager ?? $this->createMock(EntityTypeManagerInterface::class));
     $this->setInaccessibleProperty($gateway, 'eventDispatcher', $eventDispatcher ?? $this->createMock(EventDispatcherInterface::class));
     $this->setInaccessibleProperty($gateway, 'time', $time);
+
+    // Leaving $gatewayId NULL mimics the one call path where parentEntity
+    // is genuinely unavailable (see buildNotifyUrlFromFormState()'s
+    // docblock) so the fail-closed branch can be tested.
+    if ($gatewayId !== NULL) {
+      $parentEntity = $this->createMock(PaymentGatewayInterface::class);
+      $parentEntity->method('id')->willReturn($gatewayId);
+      $this->setInaccessibleProperty($gateway, 'parentEntity', $parentEntity);
+    }
 
     return $gateway;
   }
@@ -119,7 +136,7 @@ class ReepayOnNotifyTest extends UnitTestCase {
 
     $reepayService = $this->createReepayServiceMock();
     $reepayService->method('getWebhookSecret')->willReturn(self::SECRET);
-    $reepayService->expects($this->once())->method('invalidateWebhookSecret');
+    $reepayService->expects($this->once())->method('refreshWebhookSecretOncePerCooldown')->willReturn(NULL);
 
     $entityTypeManager = $this->createMock(EntityTypeManagerInterface::class);
     $entityTypeManager->expects($this->never())->method('getStorage');
@@ -156,12 +173,8 @@ class ReepayOnNotifyTest extends UnitTestCase {
     ]);
 
     $reepayService = $this->createReepayServiceMock();
-    $reepayService->expects($this->exactly(2))
-      ->method('getWebhookSecret')
-      ->willReturnCallback(function (bool $forceRefresh = FALSE) use ($rotatedSecret) {
-        return $forceRefresh ? $rotatedSecret : self::SECRET;
-      });
-    $reepayService->expects($this->once())->method('invalidateWebhookSecret');
+    $reepayService->expects($this->once())->method('getWebhookSecret')->willReturn(self::SECRET);
+    $reepayService->expects($this->once())->method('refreshWebhookSecretOncePerCooldown')->willReturn($rotatedSecret);
 
     $entityTypeManager = $this->createMock(EntityTypeManagerInterface::class);
     $entityTypeManager->expects($this->never())->method('getStorage');
@@ -251,7 +264,7 @@ class ReepayOnNotifyTest extends UnitTestCase {
     $payment->expects($this->once())->method('save');
 
     $paymentStorage = $this->createMock(EntityStorageInterface::class);
-    $paymentStorage->method('loadByProperties')->with(['order_id' => '17'])->willReturn([$payment]);
+    $paymentStorage->method('loadByProperties')->with(['order_id' => '17', 'payment_gateway' => self::GATEWAY_ID])->willReturn([$payment]);
 
     $entityTypeManager = $this->createMock(EntityTypeManagerInterface::class);
     $entityTypeManager->method('getStorage')->willReturnMap([
@@ -393,6 +406,87 @@ class ReepayOnNotifyTest extends UnitTestCase {
   }
 
   /**
+   * onNotify() is always reached through $payment_gateway->getPlugin(),
+   * which sets $this->parentEntity; if that is ever unavailable, fail
+   * closed instead of loading payments without scoping them to a gateway.
+   */
+  public function testOnNotifyFailsClosedWhenTheGatewayIsUnknown(): void {
+    $payload = $this->signedPayload();
+
+    $reepayService = $this->createReepayServiceMock();
+    $reepayService->method('getWebhookSecret')->willReturn(self::SECRET);
+    $reepayService->expects($this->never())->method('getInvoice');
+
+    $order = $this->createMock(OrderInterface::class);
+    $order->method('get')->willReturnMap([
+      ['checkout_step', (object) ['value' => 'payment']],
+      ['state', (object) ['value' => 'draft']],
+    ]);
+    $order->method('id')->willReturn(17);
+    $order->expects($this->never())->method('save');
+
+    $orderStorage = $this->createMock(EntityStorageInterface::class);
+    $orderStorage->method('load')->willReturn($order);
+
+    // commerce_payment must never be reached once the gateway is unknown.
+    $entityTypeManager = $this->createMock(EntityTypeManagerInterface::class);
+    $entityTypeManager->method('getStorage')->willReturnCallback(function (string $type) use ($orderStorage) {
+      if ($type === 'commerce_order') {
+        return $orderStorage;
+      }
+      throw new \LogicException("Unexpected getStorage('$type') after an unknown gateway should have stopped processing.");
+    });
+
+    $gateway = $this->createGateway($reepayService, $entityTypeManager, NULL, NULL);
+    $response = $gateway->onNotify($this->request($payload));
+
+    $this->assertTrue($response->isSuccessful());
+  }
+
+  /**
+   * A payment that belongs to a different Frisbii gateway on the same
+   * order (e.g. the general method and the dedicated Klarna gateway both
+   * enabled) must never be confirmed by this gateway's notification.
+   */
+  public function testPaymentFromAnotherGatewayIsNotConfirmed(): void {
+    $payload = $this->signedPayload(['event_type' => 'invoice_authorized', 'invoice' => '17']);
+
+    $reepayService = $this->createReepayServiceMock();
+    $reepayService->method('getWebhookSecret')->willReturn(self::SECRET);
+    $reepayService->method('getInvoice')->with('17')->willReturn($this->paidInvoice());
+
+    $orderState = $this->createMock(StateItemInterface::class);
+    $order = $this->createMock(OrderInterface::class);
+    $order->method('get')->willReturnMap([
+      ['checkout_step', (object) ['value' => 'payment']],
+      ['state', (object) ['value' => 'draft']],
+    ]);
+    $order->method('getState')->willReturn($orderState);
+    $order->method('getTotalPrice')->willReturn(new Price('39.00', 'USD'));
+    $order->method('id')->willReturn(17);
+    $order->expects($this->never())->method('save');
+
+    $orderStorage = $this->createMock(EntityStorageInterface::class);
+    $orderStorage->method('load')->willReturn($order);
+
+    // Only a payment on a different gateway exists for this order; the
+    // query scoped to self::GATEWAY_ID must not see it.
+    $paymentStorage = $this->createMock(EntityStorageInterface::class);
+    $paymentStorage->method('loadByProperties')->with(['order_id' => '17', 'payment_gateway' => self::GATEWAY_ID])->willReturn([]);
+
+    $entityTypeManager = $this->createMock(EntityTypeManagerInterface::class);
+    $entityTypeManager->method('getStorage')->willReturnMap([
+      ['commerce_order', $orderStorage],
+      ['commerce_payment', $paymentStorage],
+    ]);
+
+    $gateway = $this->createGateway($reepayService, $entityTypeManager);
+    $response = $gateway->onNotify($this->request($payload));
+
+    $this->assertTrue($response->isSuccessful());
+  }
+
+  /**
    * When an order ended up with more than one "new" payment (left behind by
    * repeated payment-page builds before the FD-11 fix, or simply not yet
    * cleaned up), onNotify() must confirm the most recently created "new"
@@ -442,7 +536,7 @@ class ReepayOnNotifyTest extends UnitTestCase {
     $paymentStorage = $this->createMock(EntityStorageInterface::class);
     // Deliberately returned with the stale payment first, keyed by a lower
     // entity id, to prove the selection does not just take current().
-    $paymentStorage->method('loadByProperties')->with(['order_id' => '17'])
+    $paymentStorage->method('loadByProperties')->with(['order_id' => '17', 'payment_gateway' => self::GATEWAY_ID])
       ->willReturn([5 => $stalePayment, 9 => $recentPayment]);
 
     $entityTypeManager = $this->createMock(EntityTypeManagerInterface::class);

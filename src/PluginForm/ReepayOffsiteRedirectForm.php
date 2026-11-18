@@ -2,6 +2,7 @@
 
 namespace Drupal\commerce_reepay_checkout\PluginForm;
 
+use Drupal\address\AddressInterface;
 use Drupal\commerce_payment\Entity\PaymentInterface;
 use Drupal\commerce_payment\Exception\PaymentGatewayException;
 use Drupal\commerce_payment\PluginForm\PaymentOffsiteForm;
@@ -88,11 +89,25 @@ class ReepayOffsiteRedirectForm extends PaymentOffsiteForm implements ContainerI
     $paymentGatewayPlugin = $payment->getPaymentGateway()->getPlugin();
     $payment_methods = $paymentGatewayPlugin->getReepayPaymentMethods();
 
+    // Frisbii requires an explicit billing_address on the order object for
+    // Klarna (a customer reference is not enough) and requires order_lines
+    // for a Klarna payment. Frisbii accepts EITHER amount OR order_lines on
+    // the order, never both (verified against its API: both together give
+    // 422 "either amount or order_lines must be defined"). So order_lines
+    // replaces amount only when a Klarna method is offered; every other
+    // payment keeps the plain amount it always used. billing_address is
+    // accepted alongside either, so it is always sent.
+    $billingAddress = $this->buildBillingAddress($address, $order->getEmail());
+
+    $orderAmount = $this->usesKlarna($payment_methods)
+      ? ['order_lines' => $this->buildOrderLines($paymentAmount, $order->id())]
+      : ['amount' => $paymentAmount];
+
     $payload = ['order' =>
-                 ['handle' => $invoiceHandle,
-                  'amount' => $paymentAmount,
+                 ['handle' => $invoiceHandle] + $orderAmount + [
                   'locale' => $configuration['locale'],
                   'currency' => $payment->getAmount()->getCurrencyCode(),
+                  'billing_address' => $billingAddress,
                    'customer' => [
                     'first_name' => $address->getGivenName(),
                     'last_name' => $address->getFamilyName(),
@@ -128,6 +143,67 @@ class ReepayOffsiteRedirectForm extends PaymentOffsiteForm implements ContainerI
     $order->save();
 
     return $form;
+  }
+
+  /**
+   * Whether any of the payment methods offered in this session is Klarna.
+   *
+   * Covers the dedicated gateway ("klarna") and the legacy options of the
+   * general gateway ("klarna_pay_later", "klarna_slice_it", ...).
+   *
+   * @param string[] $paymentMethods
+   *   The payment_methods values sent to Frisbii.
+   */
+  private function usesKlarna(array $paymentMethods): bool {
+    foreach ($paymentMethods as $method) {
+      if (str_starts_with((string) $method, 'klarna')) {
+        return TRUE;
+      }
+    }
+    return FALSE;
+  }
+
+  /**
+   * Builds the order-level billing_address Frisbii requires for Klarna.
+   *
+   * Klarna requires this explicitly; referencing the customer object is
+   * not enough (see the 'customer' sub-object built alongside this, which
+   * other payment methods also use).
+   */
+  private function buildBillingAddress(AddressInterface $address, string $email): array {
+    $billingAddress = [
+      'first_name' => $address->getGivenName(),
+      'last_name' => $address->getFamilyName(),
+      'address' => $address->getAddressLine1(),
+      'city' => $address->getLocality(),
+      'country' => $address->getCountryCode(),
+      'postal_code' => $address->getPostalCode(),
+      'email' => $email,
+    ];
+    if ($address->getAddressLine2()) {
+      $billingAddress['address2'] = $address->getAddressLine2();
+    }
+    return $billingAddress;
+  }
+
+  /**
+   * Builds the order_lines Frisbii requires for a Klarna payment.
+   *
+   * One line covering the whole order amount, rather than one line per
+   * order item: it satisfies Klarna's requirement that order_lines be
+   * present without risking a line-sum mismatch against the order's own
+   * adjustments (tax, shipping, discounts) that are already folded into
+   * $paymentAmount.
+   */
+  private function buildOrderLines(int $paymentAmount, $orderId): array {
+    // Plain string, not t(): this is API data sent to Frisbii, never
+    // rendered through Drupal, so it does not need translation and must
+    // not depend on the translation service being available.
+    return [[
+      'ordertext' => 'Order #' . $orderId,
+      'amount' => $paymentAmount,
+      'quantity' => 1,
+    ]];
   }
 
   /**

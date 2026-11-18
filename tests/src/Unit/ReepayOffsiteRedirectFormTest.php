@@ -2,6 +2,7 @@
 
 namespace Drupal\Tests\commerce_reepay_checkout\Unit;
 
+use Drupal\address\AddressInterface;
 use Drupal\commerce_order\Entity\OrderInterface;
 use Drupal\commerce_payment\Entity\PaymentInterface;
 use Drupal\commerce_price\Price;
@@ -36,6 +37,17 @@ class ReepayOffsiteRedirectFormTest extends UnitTestCase {
     $reflection = new \ReflectionMethod($form, 'getOpenPayment');
     $reflection->setAccessible(TRUE);
     return $reflection->invoke($form, $newPayment);
+  }
+
+  private function invokePrivateMethod(ReepayOffsiteRedirectForm $form, string $method, array $args) {
+    $reflection = new \ReflectionMethod($form, $method);
+    $reflection->setAccessible(TRUE);
+    return $reflection->invokeArgs($form, $args);
+  }
+
+  private function emptyForm(): ReepayOffsiteRedirectForm {
+    $entityTypeManager = $this->createMock(EntityTypeManagerInterface::class);
+    return $this->createForm($entityTypeManager);
   }
 
   private function newUnsavedPayment(int $orderId = 26, string $gatewayId = 'frisbii_pay') {
@@ -116,6 +128,83 @@ class ReepayOffsiteRedirectFormTest extends UnitTestCase {
     $result = $this->invokeGetOpenPayment($form, $newPayment);
 
     $this->assertSame($newerPayment, $result);
+  }
+
+  /**
+   * Covers buildBillingAddress(), the FD-13 Klarna fix: Frisbii requires an
+   * explicit billing_address on the order object for Klarna, since a
+   * customer reference is not enough.
+   */
+  public function testBuildBillingAddressMapsEveryAddressField(): void {
+    $address = $this->createMock(AddressInterface::class);
+    $address->method('getGivenName')->willReturn('Jane');
+    $address->method('getFamilyName')->willReturn('Doe');
+    $address->method('getAddressLine1')->willReturn('Main Street 1');
+    $address->method('getAddressLine2')->willReturn('');
+    $address->method('getLocality')->willReturn('Copenhagen');
+    $address->method('getCountryCode')->willReturn('DK');
+    $address->method('getPostalCode')->willReturn('1000');
+
+    $result = $this->invokePrivateMethod($this->emptyForm(), 'buildBillingAddress', [$address, 'jane@example.com']);
+
+    $this->assertSame([
+      'first_name' => 'Jane',
+      'last_name' => 'Doe',
+      'address' => 'Main Street 1',
+      'city' => 'Copenhagen',
+      'country' => 'DK',
+      'postal_code' => '1000',
+      'email' => 'jane@example.com',
+    ], $result);
+  }
+
+  public function testBuildBillingAddressIncludesAddressLine2WhenPresent(): void {
+    $address = $this->createMock(AddressInterface::class);
+    $address->method('getGivenName')->willReturn('Jane');
+    $address->method('getFamilyName')->willReturn('Doe');
+    $address->method('getAddressLine1')->willReturn('Main Street 1');
+    $address->method('getAddressLine2')->willReturn('Suite 2');
+    $address->method('getLocality')->willReturn('Copenhagen');
+    $address->method('getCountryCode')->willReturn('DK');
+    $address->method('getPostalCode')->willReturn('1000');
+
+    $result = $this->invokePrivateMethod($this->emptyForm(), 'buildBillingAddress', [$address, 'jane@example.com']);
+
+    $this->assertSame('Suite 2', $result['address2']);
+  }
+
+  /**
+   * Covers buildOrderLines(), the FD-13 Klarna fix: Frisbii requires
+   * order_lines to be present for a Klarna payment, and accepts them only
+   * INSTEAD of the order amount. One line for the whole order, so it can
+   * never disagree with the total.
+   */
+  public function testBuildOrderLinesCoversTheWholeOrderInOneLine(): void {
+    $result = $this->invokePrivateMethod($this->emptyForm(), 'buildOrderLines', [3999, 42]);
+
+    $this->assertCount(1, $result);
+    $this->assertSame(3999, $result[0]['amount']);
+    $this->assertSame(1, $result[0]['quantity']);
+    $this->assertStringContainsString('42', $result[0]['ordertext']);
+  }
+
+  public static function klarnaMethodsProvider(): array {
+    return [
+      'dedicated Klarna gateway' => [['klarna'], TRUE],
+      'legacy Klarna option among others' => [['card', 'klarna_pay_later'], TRUE],
+      'only a Klarna slice option' => [['klarna_slice_it'], TRUE],
+      'cards and wallets only' => [['card', 'visa', 'mc', 'click_to_pay', 'mobilepay'], FALSE],
+      'no methods' => [[], FALSE],
+    ];
+  }
+
+  /**
+   * Frisbii accepts order_lines OR amount, never both, so the form must know
+   * when a session involves Klarna to choose which one to send.
+   */
+  #[\PHPUnit\Framework\Attributes\DataProvider('klarnaMethodsProvider')]
+  public function testUsesKlarnaDetectsAnyKlarnaMethod(array $methods, bool $expected): void {
+    $this->assertSame($expected, $this->invokePrivateMethod($this->emptyForm(), 'usesKlarna', [$methods]));
   }
 
 }

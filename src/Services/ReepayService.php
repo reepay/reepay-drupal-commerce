@@ -27,6 +27,18 @@ class ReepayService
    */
   const WEBHOOK_SECRET_CACHE_ID_PREFIX = 'commerce_reepay_checkout:webhook_secret:';
 
+  /**
+   * How long to wait between forced refreshes of the webhook secret that
+   * were triggered by a signature mismatch, in seconds.
+   *
+   * The public notify endpoint has no authentication other than the
+   * signature itself, so without this limit every request with a wrong
+   * signature would invalidate the cache and fetch a fresh secret from
+   * Frisbii, letting an unauthenticated caller drain the cache and generate
+   * outbound API traffic at will just by posting bad signatures repeatedly.
+   */
+  const WEBHOOK_SECRET_REFRESH_COOLDOWN = 60;
+
    /**
    * @var ClientInterface
    */
@@ -73,9 +85,29 @@ class ReepayService
       $this->payload['headers']['Authorization'] = 'Basic ' . base64_encode($key . ':');
    }
 
+   /**
+    * Strips customer PII from a charge-session payload before it is logged.
+    *
+    * createChargeSession() logs the payload on every payment-page build so
+    * the outgoing payment_methods/order data can be verified via watchdog
+    * when a payment can't be tested end-to-end. The customer and
+    * billing_address objects carry name, email and address, which has no
+    * place accumulating in the log; everything else useful for tracing
+    * (handle, amount, currency, order_lines, settle, payment_methods) is
+    * kept as-is.
+    */
+   private function redactPayloadForLogging(array $payload): array {
+     foreach (['customer', 'billing_address'] as $key) {
+       if (isset($payload['order'][$key])) {
+         $payload['order'][$key] = '[redacted]';
+       }
+     }
+     return $payload;
+   }
+
    public function createChargeSession(array $payload) {
        try {
-            $this->logger->info('Create charge session payload: @payload', ['@payload' => Json::encode($payload)]);
+            $this->logger->info('Create charge session payload: @payload', ['@payload' => Json::encode($this->redactPayloadForLogging($payload))]);
 
             $this->payload['body'] = Json::encode($payload);
             $this->payload['headers']['User-Agent'] = 'drupal_commerce/1.0.0';
@@ -235,6 +267,37 @@ class ReepayService
   public function invalidateWebhookSecret(): void
   {
     $this->cache->delete($this->getWebhookSecretCacheId());
+  }
+
+  /**
+   * Refreshes the webhook secret after a signature mismatch, but at most
+   * once per WEBHOOK_SECRET_REFRESH_COOLDOWN regardless of how often this
+   * is called.
+   *
+   * A real secret rotation is picked up by whichever mismatched request
+   * (genuine or not) arrives first after the rotation; every other
+   * mismatched request within the cooldown is turned away here without
+   * touching the cache or calling Frisbii, so repeated bad signatures from
+   * an unauthenticated caller cannot force unlimited refreshes.
+   *
+   * @return string|null
+   *   The refreshed secret, or NULL when the cooldown is still active or
+   *   the refresh itself failed.
+   */
+  public function refreshWebhookSecretOncePerCooldown(): ?string
+  {
+    $cooldownId = $this->getWebhookSecretCacheId() . ':refresh_cooldown';
+    if ($this->cache->get($cooldownId)) {
+      return NULL;
+    }
+
+    // Mark the cooldown before making the request, so two mismatched
+    // requests arriving at nearly the same time cannot each trigger their
+    // own refresh.
+    $this->cache->set($cooldownId, TRUE, $this->time->getRequestTime() + self::WEBHOOK_SECRET_REFRESH_COOLDOWN);
+
+    $this->invalidateWebhookSecret();
+    return $this->getWebhookSecret(TRUE);
   }
 
   /**

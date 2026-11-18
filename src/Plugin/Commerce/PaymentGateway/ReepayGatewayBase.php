@@ -151,7 +151,22 @@ abstract class ReepayGatewayBase extends OffsitePaymentGatewayBase implements Su
       throw new PaymentGatewayException('The invoice does not belong to this order.');
     }
 
-    $payments = $this->entityTypeManager->getStorage('commerce_payment')->loadByProperties(['order_id' => $orderHandle]);
+    $gatewayId = $this->currentGatewayId();
+    if ($gatewayId === NULL) {
+      $this->reepayService->logWebhookEvent('Return rejected: could not determine the payment gateway for order_id=@order_id.', [
+        '@order_id' => $order->id(),
+      ], 'warning');
+      throw new PaymentGatewayException('Could not determine the payment gateway.');
+    }
+
+    // Scope to this gateway: an order can have payments from more than one
+    // Frisbii gateway (e.g. the general method and the dedicated Klarna
+    // gateway both enabled), and a payment from the other one must never be
+    // confirmed here.
+    $payments = $this->entityTypeManager->getStorage('commerce_payment')->loadByProperties([
+      'order_id' => $orderHandle,
+      'payment_gateway' => $gatewayId,
+    ]);
     if (!$payments) {
       $this->reepayService->logWebhookEvent('Return rejected: no payment found for order_id=@order_id.', [
         '@order_id' => $order->id(),
@@ -287,7 +302,23 @@ abstract class ReepayGatewayBase extends OffsitePaymentGatewayBase implements Su
     }
 
     // Fail closed: confirm payment with Frisbii before the order is placed.
-    $payments = $this->entityTypeManager->getStorage('commerce_payment')->loadByProperties(['order_id' => $invoice_handle]);
+    $gatewayId = $this->currentGatewayId();
+    if ($gatewayId === NULL) {
+      $this->reepayService->logWebhookEvent('Stopped: could not determine the payment gateway for order_id=@order_id (invoice=@invoice).', [
+        '@order_id' => $order->id(),
+        '@invoice' => $invoice,
+      ], 'warning');
+      return new Response();
+    }
+
+    // Scope to this gateway: an order can have payments from more than one
+    // Frisbii gateway (e.g. the general method and the dedicated Klarna
+    // gateway both enabled), and a payment from the other one must never be
+    // confirmed here.
+    $payments = $this->entityTypeManager->getStorage('commerce_payment')->loadByProperties([
+      'order_id' => $invoice_handle,
+      'payment_gateway' => $gatewayId,
+    ]);
     if (!$payments) {
       $this->reepayService->logWebhookEvent('Stopped: no payment found for order_id=@order_id (invoice=@invoice).', [
         '@order_id' => $order->id(),
@@ -393,6 +424,19 @@ abstract class ReepayGatewayBase extends OffsitePaymentGatewayBase implements Su
   }
 
   /**
+   * The ID of the payment gateway config entity running this request.
+   *
+   * onReturn()/onNotify() are always reached through
+   * $payment_gateway->getPlugin(), which populates $this->parentEntity, so
+   * this is only NULL if Commerce's call path changes underneath us; treat
+   * that as "unknown gateway" and fail closed rather than loading payments
+   * across every Frisbii gateway on the order.
+   */
+  private function currentGatewayId(): ?string {
+    return $this->parentEntity ? $this->parentEntity->id() : NULL;
+  }
+
+  /**
    * Picks which payment to confirm, when an order has more than one.
    *
    * ReepayOffsiteRedirectForm can leave behind more than one "new" payment
@@ -402,8 +446,8 @@ abstract class ReepayGatewayBase extends OffsitePaymentGatewayBase implements Su
    * to return first.
    *
    * @param \Drupal\commerce_payment\Entity\PaymentInterface[] $payments
-   *   Payments for one order, as returned by loadByProperties(). Must be
-   *   non-empty.
+   *   Payments for one order and one gateway, as returned by
+   *   loadByProperties(). Must be non-empty.
    */
   private function selectPayment(array $payments): PaymentInterface {
     ksort($payments);
@@ -445,7 +489,10 @@ abstract class ReepayGatewayBase extends OffsitePaymentGatewayBase implements Su
    * Verifies the HMAC-SHA256 signature of a webhook payload.
    *
    * Retries once against a freshly-fetched secret on mismatch, to tolerate
-   * secret rotation.
+   * secret rotation, but the refresh itself is rate-limited (see
+   * ReepayService::refreshWebhookSecretOncePerCooldown()) so an
+   * unauthenticated caller cannot trigger it on every request just by
+   * sending a wrong signature.
    */
   private function verifyWebhookSignature(array $data): bool {
     $secret = $this->reepayService->getWebhookSecret();
@@ -453,8 +500,14 @@ abstract class ReepayGatewayBase extends OffsitePaymentGatewayBase implements Su
       return TRUE;
     }
 
-    $this->reepayService->invalidateWebhookSecret();
-    $secret = $this->reepayService->getWebhookSecret(TRUE);
+    // Rate-limited: a genuine secret rotation is still caught (by whichever
+    // mismatched request arrives first), but repeated bad signatures cannot
+    // force more than one refresh per cooldown. See
+    // ReepayService::refreshWebhookSecretOncePerCooldown().
+    $secret = $this->reepayService->refreshWebhookSecretOncePerCooldown();
+    if ($secret === NULL) {
+      return FALSE;
+    }
 
     return $this->signatureMatches($data, $secret);
   }
