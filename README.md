@@ -31,7 +31,6 @@ Note that credentials are **not shared** between separate payment gateway entiti
 
 ## Changelog (Latest Release)
 v 1.1.0
-
 - [Fix] - Payment improvements.
 - [Fix] - Frisbii webhook authentication with HMAC-SHA256
 - [Feature] - Supports Visa & Mastercard Click-to-pay.
