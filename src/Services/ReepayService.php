@@ -2,6 +2,8 @@
 
 namespace Drupal\commerce_reepay_checkout\Services;
 
+use Drupal\commerce_price\Calculator;
+use Drupal\commerce_price\Price;
 use GuzzleHttp\Client;
 use GuzzleHttp\ClientInterface;
 use Drupal\Component\Datetime\TimeInterface;
@@ -98,6 +100,15 @@ class ReepayService
 
           return $return;
     }
+
+  /**
+   * Converts a price to the integer minor units (cents) Frisbii uses.
+   *
+   * Keeps the decimals: 39.99 becomes 3999, not 3900.
+   */
+  public static function toMinorUnits(Price $price): int {
+    return (int) Calculator::round(Calculator::multiply($price->getNumber(), '100'), 0);
+  }
 
   /**
    * @param $handle

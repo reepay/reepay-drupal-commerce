@@ -180,6 +180,15 @@ abstract class ReepayGatewayBase extends OffsitePaymentGatewayBase implements Su
       throw new PaymentGatewayException('Payment was not confirmed by the payment provider.');
     }
 
+    $mismatch = $this->findInvoiceMismatch($invoice, $invoiceState, $order);
+    if ($mismatch !== NULL) {
+      $this->reepayService->logWebhookEvent('Return rejected: invoice=@invoice does not match the order. @reason', [
+        '@invoice' => $invoiceHandle,
+        '@reason' => $mismatch,
+      ], 'warning');
+      throw new PaymentGatewayException('The paid amount does not match the order.');
+    }
+
     $authorize_transition = $payment->getState()->getWorkflow()->getTransition('authorize');
     $payment->getState()->applyTransition($authorize_transition);
     $state = ($invoiceState == 'authorized') ? 'authorization' : 'completed';
@@ -298,6 +307,16 @@ abstract class ReepayGatewayBase extends OffsitePaymentGatewayBase implements Su
       return new Response();
     }
 
+    $mismatch = $this->findInvoiceMismatch($invoiceData, $invoiceState, $order);
+    if ($mismatch !== NULL) {
+      $this->reepayService->logWebhookEvent('Stopped: invoice=@invoice does not match order_id=@order_id. @reason Order not placed.', [
+        '@invoice' => $invoice,
+        '@order_id' => $order->id(),
+        '@reason' => $mismatch,
+      ], 'warning');
+      return new Response();
+    }
+
     $order->set('checkout_step', 'complete');
     $event = new OrderEvent($order);
     $this->eventDispatcher->dispatch($event, CheckoutEvents::COMPLETION);
@@ -329,6 +348,43 @@ abstract class ReepayGatewayBase extends OffsitePaymentGatewayBase implements Su
     ]);
 
     return new Response();
+  }
+
+  /**
+   * Checks that the invoice Frisbii reports covers the whole order.
+   *
+   * Compares the invoice amount (minor units) and currency with the order
+   * total. A settled invoice must also show the full amount as settled.
+   * Fails closed: missing data counts as a mismatch.
+   *
+   * @return string|null
+   *   NULL when the invoice matches the order, otherwise the reason.
+   */
+  private function findInvoiceMismatch(array $invoice, string $invoiceState, OrderInterface $order): ?string {
+    $total = $order->getTotalPrice();
+    if (!$total instanceof Price) {
+      return 'The order has no total.';
+    }
+
+    $expectedAmount = ReepayService::toMinorUnits($total);
+    $invoiceAmount = $invoice['amount'] ?? NULL;
+    if (!is_int($invoiceAmount) || $invoiceAmount !== $expectedAmount) {
+      return sprintf('Amount: order=%d, invoice=%s.', $expectedAmount, is_scalar($invoiceAmount) ? $invoiceAmount : 'missing');
+    }
+
+    $invoiceCurrency = $invoice['currency'] ?? NULL;
+    if (!is_string($invoiceCurrency) || strcasecmp($invoiceCurrency, $total->getCurrencyCode()) !== 0) {
+      return sprintf('Currency: order=%s, invoice=%s.', $total->getCurrencyCode(), is_string($invoiceCurrency) ? $invoiceCurrency : 'missing');
+    }
+
+    if ($invoiceState === 'settled') {
+      $settled = $invoice['settled_amount'] ?? NULL;
+      if (!is_int($settled) || $settled < $expectedAmount) {
+        return sprintf('Settled amount: order=%d, invoice=%s.', $expectedAmount, is_scalar($settled) ? $settled : 'missing');
+      }
+    }
+
+    return NULL;
   }
 
   /**
@@ -473,7 +529,7 @@ abstract class ReepayGatewayBase extends OffsitePaymentGatewayBase implements Su
 
   public function capturePayment(PaymentInterface $payment, ?Price $amount = NULL)
   {
-    $paymentAmount = (int) $amount->getNumber() * 100;
+    $paymentAmount = ReepayService::toMinorUnits($amount);
     $configuration = $payment->getPaymentGateway()->getPlugin()->getConfiguration();
 
     if('test' == $configuration['mode']) {
@@ -520,7 +576,7 @@ abstract class ReepayGatewayBase extends OffsitePaymentGatewayBase implements Su
       $payment->setState('refunded');
     }
 
-    $paymentAmount = (int) $amount->getNumber() * 100;
+    $paymentAmount = ReepayService::toMinorUnits($amount);
     $return = $this->reepayService->refund($payment->getRemoteId(), $paymentAmount);
     if('success' == $return['result'] ) {
       $payment->setRefundedAmount($new_refunded_amount);

@@ -81,7 +81,7 @@ class ReepayOffsiteRedirectForm extends PaymentOffsiteForm implements ContainerI
         $invoiceHandle = $invoiceHandle  . '-' . time();
     }
 
-    $paymentAmount = (int) $payment->getAmount()->getNumber() * 100;
+    $paymentAmount = ReepayService::toMinorUnits($payment->getAmount());
 
     $address = $order->getBillingProfile()->address->first();
 

@@ -4,6 +4,7 @@ namespace Drupal\Tests\commerce_reepay_checkout\Unit;
 
 use Drupal\commerce_order\Entity\OrderInterface;
 use Drupal\commerce_payment\Entity\PaymentInterface;
+use Drupal\commerce_price\Price;
 use Drupal\commerce_reepay_checkout\Plugin\Commerce\PaymentGateway\ReepayGatewayBase;
 use Drupal\commerce_reepay_checkout\Services\ReepayService;
 use Drupal\Component\Datetime\TimeInterface;
@@ -14,6 +15,7 @@ use Drupal\state_machine\Plugin\Field\FieldType\StateItemInterface;
 use Drupal\state_machine\Plugin\Workflow\WorkflowInterface;
 use Drupal\state_machine\Plugin\Workflow\WorkflowTransition;
 use PHPUnit\Framework\Attributes\CoversClass;
+use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\Attributes\Group;
 use Symfony\Component\EventDispatcher\EventDispatcherInterface;
 use Symfony\Component\HttpFoundation\Request;
@@ -85,6 +87,13 @@ class ReepayOnNotifyTest extends UnitTestCase {
 
   private function request(array $payload): Request {
     return new Request([], [], [], [], [], [], json_encode($payload));
+  }
+
+  /**
+   * An authorized Frisbii invoice for the standard 39.00 USD test order.
+   */
+  private function paidInvoice(array $overrides = []): array {
+    return array_merge(['state' => 'authorized', 'amount' => 3900, 'currency' => 'USD'], $overrides);
   }
 
   public function testMissingFieldIsRejectedWithoutTouchingSecretOrEntities(): void {
@@ -206,7 +215,7 @@ class ReepayOnNotifyTest extends UnitTestCase {
 
     $reepayService = $this->createReepayServiceMock();
     $reepayService->method('getWebhookSecret')->willReturn(self::SECRET);
-    $reepayService->expects($this->once())->method('getInvoice')->with('17-abc')->willReturn(['state' => 'authorized']);
+    $reepayService->expects($this->once())->method('getInvoice')->with('17-abc')->willReturn($this->paidInvoice());
 
     $orderState = $this->createMock(StateItemInterface::class);
     $orderState->expects($this->once())->method('applyTransitionById')->with('place');
@@ -219,7 +228,7 @@ class ReepayOnNotifyTest extends UnitTestCase {
       ['state', $stateField],
     ]);
     $order->method('getState')->willReturn($orderState);
-    $order->method('getTotalPrice')->willReturn(NULL);
+    $order->method('getTotalPrice')->willReturn(new Price('39.00', 'USD'));
     $order->method('id')->willReturn(17);
     $order->expects($this->once())->method('save');
     $order->expects($this->once())->method('unlock');
@@ -317,6 +326,7 @@ class ReepayOnNotifyTest extends UnitTestCase {
       ['state', (object) ['value' => 'draft']],
     ]);
     $order->method('getState')->willReturn($orderState);
+    $order->method('getTotalPrice')->willReturn(new Price('39.00', 'USD'));
     $order->method('id')->willReturn($orderId);
     $order->expects($this->never())->method('save');
 
@@ -370,7 +380,7 @@ class ReepayOnNotifyTest extends UnitTestCase {
 
     $reepayService = $this->createReepayServiceMock();
     $reepayService->method('getWebhookSecret')->willReturn(self::SECRET);
-    $reepayService->method('getInvoice')->with('17')->willReturn(['state' => 'authorized']);
+    $reepayService->method('getInvoice')->with('17')->willReturn($this->paidInvoice());
 
     $orderState = $this->createMock(StateItemInterface::class);
     $order = $this->createMock(OrderInterface::class);
@@ -379,7 +389,7 @@ class ReepayOnNotifyTest extends UnitTestCase {
       ['state', (object) ['value' => 'draft']],
     ]);
     $order->method('getState')->willReturn($orderState);
-    $order->method('getTotalPrice')->willReturn(NULL);
+    $order->method('getTotalPrice')->willReturn(new Price('39.00', 'USD'));
     $order->method('id')->willReturn(17);
 
     $orderStorage = $this->createMock(EntityStorageInterface::class);
@@ -422,6 +432,73 @@ class ReepayOnNotifyTest extends UnitTestCase {
     $response = $gateway->onNotify($this->request($payload));
 
     $this->assertTrue($response->isSuccessful());
+  }
+
+  public static function mismatchedInvoiceProvider(): array {
+    return [
+      'lower amount' => [['state' => 'authorized', 'amount' => 3800, 'currency' => 'USD']],
+      'higher amount' => [['state' => 'authorized', 'amount' => 4000, 'currency' => 'USD']],
+      'different currency' => [['state' => 'authorized', 'amount' => 3900, 'currency' => 'EUR']],
+      'missing amount' => [['state' => 'authorized', 'currency' => 'USD']],
+      'missing currency' => [['state' => 'authorized', 'amount' => 3900]],
+      'amount as text' => [['state' => 'authorized', 'amount' => '3900', 'currency' => 'USD']],
+      'settled without settled amount' => [['state' => 'settled', 'amount' => 3900, 'currency' => 'USD']],
+      'settled with a lower settled amount' => [['state' => 'settled', 'amount' => 3900, 'currency' => 'USD', 'settled_amount' => 1000]],
+    ];
+  }
+
+  #[DataProvider('mismatchedInvoiceProvider')]
+  public function testInvoiceThatDoesNotCoverTheOrderDoesNotPlaceIt(array $invoice): void {
+    [$gateway] = $this->notifyGatewayForUnplacedOrder($invoice);
+    $response = $gateway->onNotify($this->request($this->signedPayload()));
+    $this->assertTrue($response->isSuccessful());
+  }
+
+  /**
+   * A total with cents must be compared in minor units without losing the
+   * decimals: 39.99 is 3999, not 3900.
+   */
+  public function testOrderTotalWithCentsMatchesInvoiceInMinorUnits(): void {
+    $payload = $this->signedPayload(['invoice' => '17']);
+
+    $reepayService = $this->createReepayServiceMock();
+    $reepayService->method('getWebhookSecret')->willReturn(self::SECRET);
+    $reepayService->method('getInvoice')->willReturn($this->paidInvoice(['amount' => 3999]));
+
+    $orderState = $this->createMock(StateItemInterface::class);
+    $orderState->expects($this->once())->method('applyTransitionById')->with('place');
+    $order = $this->createMock(OrderInterface::class);
+    $order->method('get')->willReturnMap([
+      ['checkout_step', (object) ['value' => 'payment']],
+      ['state', (object) ['value' => 'draft']],
+    ]);
+    $order->method('getState')->willReturn($orderState);
+    $order->method('getTotalPrice')->willReturn(new Price('39.99', 'USD'));
+    $order->method('id')->willReturn(17);
+    $order->expects($this->once())->method('save');
+
+    $orderStorage = $this->createMock(EntityStorageInterface::class);
+    $orderStorage->method('load')->willReturn($order);
+
+    $workflow = $this->createMock(WorkflowInterface::class);
+    $workflow->method('getTransition')->willReturn($this->createMock(WorkflowTransition::class));
+    $paymentState = $this->createMock(StateItemInterface::class);
+    $paymentState->method('getId')->willReturn('new');
+    $paymentState->method('getWorkflow')->willReturn($workflow);
+    $payment = $this->createMock(PaymentInterface::class);
+    $payment->method('getState')->willReturn($paymentState);
+    $payment->expects($this->once())->method('save');
+    $paymentStorage = $this->createMock(EntityStorageInterface::class);
+    $paymentStorage->method('loadByProperties')->willReturn([$payment]);
+
+    $entityTypeManager = $this->createMock(EntityTypeManagerInterface::class);
+    $entityTypeManager->method('getStorage')->willReturnMap([
+      ['commerce_order', $orderStorage],
+      ['commerce_payment', $paymentStorage],
+    ]);
+
+    $gateway = $this->createGateway($reepayService, $entityTypeManager);
+    $this->assertTrue($gateway->onNotify($this->request($payload))->isSuccessful());
   }
 
   public function testInvalidSignatureDoesNotWait(): void {
