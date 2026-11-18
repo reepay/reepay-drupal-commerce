@@ -7,6 +7,7 @@ use Drupal\commerce_order\Entity\OrderInterface;
 use Drupal\commerce_order\Event\OrderEvent;
 use Drupal\commerce_payment\Entity\PaymentInterface;
 use Drupal\commerce_payment\Exception\InvalidRequestException;
+use Drupal\commerce_payment\Exception\PaymentGatewayException;
 use Drupal\commerce_payment\Plugin\Commerce\PaymentGateway\OffsitePaymentGatewayBase;
 use Drupal\commerce_payment\Plugin\Commerce\PaymentGateway\SupportsAuthorizationsInterface;
 use Drupal\commerce_payment\Plugin\Commerce\PaymentGateway\SupportsRefundsInterface;
@@ -135,42 +136,62 @@ abstract class ReepayGatewayBase extends OffsitePaymentGatewayBase implements Su
   public function onReturn(OrderInterface $order, Request $request)
   {
     parent::onReturn( $order, $request);
-    $invoice = $request->get('invoice');
-    if($pos = strpos($invoice, '-')) {
-         $invoice =  substr($invoice, 0, $pos);
+    $invoiceHandle = (string) $request->get('invoice');
+    $orderHandle = $invoiceHandle;
+    if($pos = strpos($orderHandle, '-')) {
+         $orderHandle =  substr($orderHandle, 0, $pos);
     }
 
-    $payment = $this->entityTypeManager->getStorage('commerce_payment')->loadByProperties(['order_id' => $invoice]);
+    // The invoice must belong to the order that is being checked out.
+    if ($orderHandle === '' || $orderHandle !== (string) $order->id()) {
+      $this->reepayService->logWebhookEvent('Return rejected: invoice=@invoice does not match order_id=@order_id.', [
+        '@invoice' => $invoiceHandle,
+        '@order_id' => $order->id(),
+      ], 'warning');
+      throw new PaymentGatewayException('The invoice does not belong to this order.');
+    }
 
-    if($payment) {
-     $payment = current($payment);
-     $configuration = $payment->getPaymentGateway()->getPlugin()->getConfiguration();
+    $payments = $this->entityTypeManager->getStorage('commerce_payment')->loadByProperties(['order_id' => $orderHandle]);
+    if (!$payments) {
+      $this->reepayService->logWebhookEvent('Return rejected: no payment found for order_id=@order_id.', [
+        '@order_id' => $order->id(),
+      ], 'warning');
+      throw new PaymentGatewayException('No payment was found for this order.');
+    }
 
-     if('test' == $configuration['mode']) {
+    $payment = current($payments);
+    $configuration = $payment->getPaymentGateway()->getPlugin()->getConfiguration();
+
+    if('test' == $configuration['mode']) {
       $key = $configuration['test_private_key'];
     } else {
       $key = $configuration['live_private_key'];
     }
-     $this->reepayService->setPrivateKey($key);
-     $invoice = $this->reepayService->getInvoice($request->get('invoice'));
+    $this->reepayService->setPrivateKey($key);
+    $invoice = $this->reepayService->getInvoice($invoiceHandle);
 
-     if($invoice['state'] == 'settled' || $invoice['state'] == 'authorized') {
-
-           $authorize_transition = $payment->getState()->getWorkflow()->getTransition('authorize');
-           $payment->getState()->applyTransition($authorize_transition);
-           $state = ($invoice['state'] == 'authorized') ? 'authorization' : 'completed';
-           $payment->set('state', $state);
-           $payment->set('amount', $order->getTotalPrice());
-           $payment->set('order_id', $order->id());
-           $payment->set('test', $configuration['mode'] == 'test');
-           $payment->set('remote_id', $request->get('invoice'));
-           $payment->set('remote_state', $state);
-           $request_time = \Drupal::time()->getRequestTime();
-           $payment->set('authorized', $request_time);
-           $payment->save();
-       }
+    // Fail closed: no data (API error) or an unpaid invoice must not place the order.
+    $invoiceState = is_array($invoice) ? ($invoice['state'] ?? NULL) : NULL;
+    if (!in_array($invoiceState, ['settled', 'authorized'], TRUE)) {
+      $this->reepayService->logWebhookEvent('Return rejected: invoice=@invoice is not authorized/settled (state=@state).', [
+        '@invoice' => $invoiceHandle,
+        '@state' => $invoiceState ?? 'unknown',
+      ], 'warning');
+      throw new PaymentGatewayException('Payment was not confirmed by the payment provider.');
     }
 
+    $authorize_transition = $payment->getState()->getWorkflow()->getTransition('authorize');
+    $payment->getState()->applyTransition($authorize_transition);
+    $state = ($invoiceState == 'authorized') ? 'authorization' : 'completed';
+    $payment->set('state', $state);
+    $payment->set('amount', $order->getTotalPrice());
+    $payment->set('order_id', $order->id());
+    $payment->set('test', $configuration['mode'] == 'test');
+    $payment->set('remote_id', $invoiceHandle);
+    $payment->set('remote_state', $state);
+    $request_time = \Drupal::time()->getRequestTime();
+    $payment->set('authorized', $request_time);
+    $payment->save();
   }
 
   /**

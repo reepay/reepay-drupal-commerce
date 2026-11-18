@@ -109,7 +109,11 @@ class ReepayService
            $result = $this->client->get("https://api.reepay.com/v1/invoice/{$handle}", $this->payload);
            return Json::decode($result->getBody());
        } catch(\Exception $e) {
-
+           $this->logger->error('Get invoice @handle failed: @message', [
+             '@handle' => $handle,
+             '@message' => $e->getMessage(),
+           ]);
+           return NULL;
        }
   }
 
