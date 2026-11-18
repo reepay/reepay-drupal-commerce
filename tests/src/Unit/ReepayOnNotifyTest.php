@@ -4,7 +4,7 @@ namespace Drupal\Tests\commerce_reepay_checkout\Unit;
 
 use Drupal\commerce_order\Entity\OrderInterface;
 use Drupal\commerce_payment\Entity\PaymentInterface;
-use Drupal\commerce_reepay_checkout\Plugin\Commerce\PaymentGateway\Reepay;
+use Drupal\commerce_reepay_checkout\Plugin\Commerce\PaymentGateway\ReepayGatewayBase;
 use Drupal\commerce_reepay_checkout\Services\ReepayService;
 use Drupal\Component\Datetime\TimeInterface;
 use Drupal\Core\Entity\EntityStorageInterface;
@@ -18,7 +18,7 @@ use PHPUnit\Framework\Attributes\Group;
 use Symfony\Component\EventDispatcher\EventDispatcherInterface;
 use Symfony\Component\HttpFoundation\Request;
 
-#[CoversClass(Reepay::class)]
+#[CoversClass(ReepayGatewayBase::class)]
 #[Group('commerce_reepay_checkout')]
 class ReepayOnNotifyTest extends UnitTestCase {
 
@@ -31,7 +31,7 @@ class ReepayOnNotifyTest extends UnitTestCase {
    * run instantly; every other collaborator is injected via reflection
    * since the plugin has no public setters for them.
    */
-  private function createGateway(ReepayService $reepayService, ?EntityTypeManagerInterface $entityTypeManager = NULL, ?EventDispatcherInterface $eventDispatcher = NULL): Reepay {
+  private function createGateway(ReepayService $reepayService, ?EntityTypeManagerInterface $entityTypeManager = NULL, ?EventDispatcherInterface $eventDispatcher = NULL): ReepayGatewayBase {
     $configuration = [
       'mode' => 'test',
       'test_private_key' => 'test-key',
@@ -39,9 +39,9 @@ class ReepayOnNotifyTest extends UnitTestCase {
     ];
 
     /** @var \Drupal\commerce_reepay_checkout\Plugin\Commerce\PaymentGateway\Reepay $gateway */
-    $gateway = $this->getMockBuilder(Reepay::class)
+    $gateway = $this->getMockBuilder(ReepayGatewayBase::class)
       ->setConstructorArgs([$configuration, 'reepay_checkout', []])
-      ->onlyMethods(['sleepBeforeNotifyProcessing'])
+      ->onlyMethods(['sleepBeforeNotifyProcessing', 'getReepayPaymentMethods'])
       ->getMock();
 
     $time = $this->createMock(TimeInterface::class);
@@ -292,6 +292,81 @@ class ReepayOnNotifyTest extends UnitTestCase {
         $this->assertNotSame($forgedSignature, $value);
       }
     }
+  }
+
+
+  /**
+   * Builds mocks for a draft order at the payment step that must NOT be placed.
+   */
+  private function notifyGatewayForUnplacedOrder(?array $invoiceResult, bool $withPayment = TRUE, int $orderId = 17, bool $expectInvoiceCall = TRUE): array {
+    $reepayService = $this->createReepayServiceMock();
+    $reepayService->method('getWebhookSecret')->willReturn(self::SECRET);
+    if ($expectInvoiceCall) {
+      $reepayService->expects($this->once())->method('getInvoice')->willReturn($invoiceResult);
+    }
+    else {
+      $reepayService->expects($this->never())->method('getInvoice');
+    }
+
+    $orderState = $this->createMock(StateItemInterface::class);
+    $orderState->expects($this->never())->method('applyTransitionById');
+
+    $order = $this->createMock(OrderInterface::class);
+    $order->method('get')->willReturnMap([
+      ['checkout_step', (object) ['value' => 'payment']],
+      ['state', (object) ['value' => 'draft']],
+    ]);
+    $order->method('getState')->willReturn($orderState);
+    $order->method('id')->willReturn($orderId);
+    $order->expects($this->never())->method('save');
+
+    $orderStorage = $this->createMock(EntityStorageInterface::class);
+    $orderStorage->method('load')->willReturn($order);
+
+    $payment = $this->createMock(PaymentInterface::class);
+    $payment->expects($this->never())->method('save');
+    $paymentStorage = $this->createMock(EntityStorageInterface::class);
+    $paymentStorage->method('loadByProperties')->willReturn($withPayment ? [$payment] : []);
+
+    $entityTypeManager = $this->createMock(EntityTypeManagerInterface::class);
+    $entityTypeManager->method('getStorage')->willReturnMap([
+      ['commerce_order', $orderStorage],
+      ['commerce_payment', $paymentStorage],
+    ]);
+
+    return [$this->createGateway($reepayService, $entityTypeManager), $reepayService];
+  }
+
+  public function testUnpaidInvoiceDoesNotPlaceOrder(): void {
+    [$gateway] = $this->notifyGatewayForUnplacedOrder(['state' => 'created']);
+    $response = $gateway->onNotify($this->request($this->signedPayload()));
+    $this->assertTrue($response->isSuccessful());
+  }
+
+  public function testMissingInvoiceDataDoesNotPlaceOrder(): void {
+    [$gateway] = $this->notifyGatewayForUnplacedOrder(NULL);
+    $response = $gateway->onNotify($this->request($this->signedPayload()));
+    $this->assertTrue($response->isSuccessful());
+  }
+
+  public function testMissingPaymentEntityDoesNotPlaceOrder(): void {
+    [$gateway] = $this->notifyGatewayForUnplacedOrder(['state' => 'settled'], FALSE, 17, FALSE);
+    $response = $gateway->onNotify($this->request($this->signedPayload()));
+    $this->assertTrue($response->isSuccessful());
+  }
+
+  public function testInvalidSignatureDoesNotWait(): void {
+    $reepayService = $this->createReepayServiceMock();
+    $reepayService->method('getWebhookSecret')->willReturn(self::SECRET);
+    $gateway = $this->getMockBuilder(ReepayGatewayBase::class)
+      ->setConstructorArgs([['mode' => 'test', 'test_private_key' => 'k', 'live_private_key' => 'k'], 'reepay_checkout', []])
+      ->onlyMethods(['sleepBeforeNotifyProcessing', 'getReepayPaymentMethods'])
+      ->getMock();
+    $gateway->expects($this->never())->method('sleepBeforeNotifyProcessing');
+    $this->setInaccessibleProperty($gateway, 'reepayService', $reepayService);
+
+    $response = $gateway->onNotify($this->request($this->signedPayload(['signature' => 'bad'])));
+    $this->assertSame(403, $response->getStatusCode());
   }
 
 }

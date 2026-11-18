@@ -206,8 +206,6 @@ abstract class ReepayGatewayBase extends OffsitePaymentGatewayBase implements Su
 
   public function onNotify(Request $request)
   {
-    $this->sleepBeforeNotifyProcessing();
-
     $decoded_result = Json::decode($request->getContent());
     $remoteAddr = $request->getClientIp() ?? 'unknown';
 
@@ -255,6 +253,10 @@ abstract class ReepayGatewayBase extends OffsitePaymentGatewayBase implements Su
       return new Response();
     }
 
+    // Only a verified, handled event reaches this point. The delay lets
+    // onReturn() place the order first; unauthenticated requests never wait.
+    $this->sleepBeforeNotifyProcessing();
+
     $invoice_handle = $invoice;
 
     if($pos = strpos($invoice_handle, '-')) {
@@ -267,59 +269,64 @@ abstract class ReepayGatewayBase extends OffsitePaymentGatewayBase implements Su
       return new Response();
     }
 
-    $payment = $this->entityTypeManager->getStorage('commerce_payment')->loadByProperties(['order_id' => $invoice_handle]);
-
-    if($order->get('checkout_step')->value == 'payment' &&  $order->get('state')->value == 'draft') {
-      $order->set('checkout_step', 'complete');
-      $event = new OrderEvent($order);
-      $this->eventDispatcher->dispatch($event, CheckoutEvents::COMPLETION);
-      $order->getState()->applyTransitionById('place');
-      $order->unlock();
-      $order->save();
-
-      $this->reepayService->logWebhookEvent('Placed: order_id=@order_id (invoice=@invoice) moved to complete/place.', [
-        '@order_id' => $order->id(),
-        '@invoice' => $invoice,
-      ]);
-
-      if($payment) {
-        $payment = current($payment);
-        $invoiceData = $this->reepayService->getInvoice($decoded_result['invoice']);
-
-        if ($invoiceData['state'] == 'settled' || $invoiceData['state'] == 'authorized') {
-          $authorize_transition = $payment->getState()->getWorkflow()->getTransition('authorize');
-          $payment->getState()->applyTransition($authorize_transition);
-          $state = ($invoiceData['state'] == 'authorized') ? 'authorization' : 'completed';
-          $payment->set('state', $state);
-          $payment->set('amount', $order->getTotalPrice());
-          $payment->set('order_id', $order->id());
-          $payment->set('test', $mode == 'test');
-          $payment->set('remote_id', $decoded_result['invoice']);
-          $payment->set('remote_state', $state);
-          $payment->set('authorized', $this->time->getRequestTime());
-          $payment->save();
-
-          $this->reepayService->logWebhookEvent('Updated: payment for order_id=@order_id (invoice=@invoice) set to state=@state.', [
-            '@order_id' => $order->id(),
-            '@invoice' => $invoice,
-            '@state' => $state,
-          ]);
-        }
-        else {
-          $this->reepayService->logWebhookEvent('Stopped: invoice=@invoice is not authorized/settled (state=@state).', [
-            '@invoice' => $invoice,
-            '@state' => $invoiceData['state'] ?? 'n/a',
-          ]);
-        }
-
-      }
-    }
-    else {
+    if($order->get('checkout_step')->value != 'payment' || $order->get('state')->value != 'draft') {
       $this->reepayService->logWebhookEvent('Skipped: order_id=@order_id (invoice=@invoice) is not in checkout_step=payment/state=draft, no update needed.', [
         '@order_id' => $order->id(),
         '@invoice' => $invoice,
       ]);
+      return new Response();
     }
+
+    // Fail closed: confirm payment with Frisbii before the order is placed.
+    $payments = $this->entityTypeManager->getStorage('commerce_payment')->loadByProperties(['order_id' => $invoice_handle]);
+    if (!$payments) {
+      $this->reepayService->logWebhookEvent('Stopped: no payment found for order_id=@order_id (invoice=@invoice).', [
+        '@order_id' => $order->id(),
+        '@invoice' => $invoice,
+      ], 'warning');
+      return new Response();
+    }
+    $payment = current($payments);
+
+    $invoiceData = $this->reepayService->getInvoice($invoice);
+    $invoiceState = is_array($invoiceData) ? ($invoiceData['state'] ?? NULL) : NULL;
+    if (!in_array($invoiceState, ['settled', 'authorized'], TRUE)) {
+      $this->reepayService->logWebhookEvent('Stopped: invoice=@invoice is not authorized/settled (state=@state). Order not placed.', [
+        '@invoice' => $invoice,
+        '@state' => $invoiceState ?? 'unknown',
+      ], 'warning');
+      return new Response();
+    }
+
+    $order->set('checkout_step', 'complete');
+    $event = new OrderEvent($order);
+    $this->eventDispatcher->dispatch($event, CheckoutEvents::COMPLETION);
+    $order->getState()->applyTransitionById('place');
+    $order->unlock();
+    $order->save();
+
+    $this->reepayService->logWebhookEvent('Placed: order_id=@order_id (invoice=@invoice) moved to complete/place.', [
+      '@order_id' => $order->id(),
+      '@invoice' => $invoice,
+    ]);
+
+    $authorize_transition = $payment->getState()->getWorkflow()->getTransition('authorize');
+    $payment->getState()->applyTransition($authorize_transition);
+    $state = ($invoiceState == 'authorized') ? 'authorization' : 'completed';
+    $payment->set('state', $state);
+    $payment->set('amount', $order->getTotalPrice());
+    $payment->set('order_id', $order->id());
+    $payment->set('test', $mode == 'test');
+    $payment->set('remote_id', $invoice);
+    $payment->set('remote_state', $state);
+    $payment->set('authorized', $this->time->getRequestTime());
+    $payment->save();
+
+    $this->reepayService->logWebhookEvent('Updated: payment for order_id=@order_id (invoice=@invoice) set to state=@state.', [
+      '@order_id' => $order->id(),
+      '@invoice' => $invoice,
+      '@state' => $state,
+    ]);
 
     return new Response();
   }
