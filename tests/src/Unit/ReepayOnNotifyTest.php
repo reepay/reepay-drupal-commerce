@@ -4,6 +4,7 @@ namespace Drupal\Tests\commerce_reepay_checkout\Unit;
 
 use Drupal\commerce_order\Entity\OrderInterface;
 use Drupal\commerce_payment\Entity\PaymentInterface;
+use Drupal\commerce_price\Entity\CurrencyInterface;
 use Drupal\commerce_price\Price;
 use Drupal\commerce_reepay_checkout\Plugin\Commerce\PaymentGateway\ReepayGatewayBase;
 use Drupal\commerce_reepay_checkout\Services\ReepayService;
@@ -202,6 +203,7 @@ class ReepayOnNotifyTest extends UnitTestCase {
     $entityTypeManager->method('getStorage')->willReturnMap([
       ['commerce_order', $orderStorage],
       ['commerce_payment', $paymentStorage],
+      ['commerce_currency', $this->currencyStorage($currencies ?? NULL)],
     ]);
 
     $gateway = $this->createGateway($reepayService, $entityTypeManager);
@@ -255,6 +257,7 @@ class ReepayOnNotifyTest extends UnitTestCase {
     $entityTypeManager->method('getStorage')->willReturnMap([
       ['commerce_order', $orderStorage],
       ['commerce_payment', $paymentStorage],
+      ['commerce_currency', $this->currencyStorage($currencies ?? NULL)],
     ]);
 
     $gateway = $this->createGateway($reepayService, $entityTypeManager);
@@ -305,9 +308,28 @@ class ReepayOnNotifyTest extends UnitTestCase {
 
 
   /**
+   * Commerce currency storage mock: currency code => number of decimals.
+   *
+   * A code that is not in the list loads as NULL (unknown currency).
+   */
+  private function currencyStorage(?array $digitsByCode = NULL): EntityStorageInterface {
+    $digitsByCode ??= ['USD' => 2, 'JPY' => 0, 'KWD' => 3];
+    $storage = $this->createMock(EntityStorageInterface::class);
+    $storage->method('load')->willReturnCallback(function (string $code) use ($digitsByCode) {
+      if (!isset($digitsByCode[$code])) {
+        return NULL;
+      }
+      $currency = $this->createMock(CurrencyInterface::class);
+      $currency->method('getFractionDigits')->willReturn($digitsByCode[$code]);
+      return $currency;
+    });
+    return $storage;
+  }
+
+  /**
    * Builds mocks for a draft order at the payment step that must NOT be placed.
    */
-  private function notifyGatewayForUnplacedOrder(?array $invoiceResult, bool $withPayment = TRUE, int $orderId = 17, bool $expectInvoiceCall = TRUE): array {
+  private function notifyGatewayForUnplacedOrder(?array $invoiceResult, bool $withPayment = TRUE, int $orderId = 17, bool $expectInvoiceCall = TRUE, ?Price $total = NULL, ?array $currencies = NULL): array {
     $reepayService = $this->createReepayServiceMock();
     $reepayService->method('getWebhookSecret')->willReturn(self::SECRET);
     if ($expectInvoiceCall) {
@@ -326,7 +348,7 @@ class ReepayOnNotifyTest extends UnitTestCase {
       ['state', (object) ['value' => 'draft']],
     ]);
     $order->method('getState')->willReturn($orderState);
-    $order->method('getTotalPrice')->willReturn(new Price('39.00', 'USD'));
+    $order->method('getTotalPrice')->willReturn($total ?? new Price('39.00', 'USD'));
     $order->method('id')->willReturn($orderId);
     $order->expects($this->never())->method('save');
 
@@ -346,6 +368,7 @@ class ReepayOnNotifyTest extends UnitTestCase {
     $entityTypeManager->method('getStorage')->willReturnMap([
       ['commerce_order', $orderStorage],
       ['commerce_payment', $paymentStorage],
+      ['commerce_currency', $this->currencyStorage($currencies ?? NULL)],
     ]);
 
     return [$this->createGateway($reepayService, $entityTypeManager), $reepayService];
@@ -426,6 +449,7 @@ class ReepayOnNotifyTest extends UnitTestCase {
     $entityTypeManager->method('getStorage')->willReturnMap([
       ['commerce_order', $orderStorage],
       ['commerce_payment', $paymentStorage],
+      ['commerce_currency', $this->currencyStorage($currencies ?? NULL)],
     ]);
 
     $gateway = $this->createGateway($reepayService, $entityTypeManager);
@@ -459,11 +483,62 @@ class ReepayOnNotifyTest extends UnitTestCase {
    * decimals: 39.99 is 3999, not 3900.
    */
   public function testOrderTotalWithCentsMatchesInvoiceInMinorUnits(): void {
+    $this->assertOrderIsPlacedForTotal(new Price('39.99', 'USD'), 3999, 'USD');
+  }
+
+  /**
+   * The invoice amount is in the smallest unit of the order currency, so the
+   * factor follows the currency's decimals (FD-13).
+   */
+  public static function currencyUnitsProvider(): array {
+    return [
+      'two decimals' => ['39.99', 'USD', 3999],
+      'zero decimals' => ['1000', 'JPY', 1000],
+      'three decimals' => ['1.234', 'KWD', 1234],
+    ];
+  }
+
+  #[DataProvider('currencyUnitsProvider')]
+  public function testOrderIsPlacedWhenInvoiceUsesTheCurrencyOwnUnit(string $total, string $currency, int $invoiceAmount): void {
+    $this->assertOrderIsPlacedForTotal(new Price($total, $currency), $invoiceAmount, $currency);
+  }
+
+  /**
+   * The old fixed factor of 100 must no longer be accepted for JPY and KWD.
+   */
+  public static function oldFactorProvider(): array {
+    return [
+      'JPY times 100' => ['1000', 'JPY', 100000],
+      'KWD times 100' => ['1.234', 'KWD', 123],
+    ];
+  }
+
+  #[DataProvider('oldFactorProvider')]
+  public function testInvoiceWithTheOldFactorOfOneHundredDoesNotPlaceTheOrder(string $total, string $currency, int $invoiceAmount): void {
+    [$gateway] = $this->notifyGatewayForUnplacedOrder(
+      $this->paidInvoice(['amount' => $invoiceAmount, 'currency' => $currency, 'settled_amount' => $invoiceAmount]),
+      TRUE, 17, TRUE, new Price($total, $currency)
+    );
+    $this->assertTrue($gateway->onNotify($this->request($this->signedPayload()))->isSuccessful());
+  }
+
+  /**
+   * An order currency that Commerce cannot load must not be guessed.
+   */
+  public function testUnknownCurrencyDoesNotPlaceTheOrder(): void {
+    [$gateway] = $this->notifyGatewayForUnplacedOrder(
+      $this->paidInvoice(['amount' => 3900, 'currency' => 'EUR', 'settled_amount' => 3900]),
+      TRUE, 17, TRUE, new Price('39.00', 'EUR'), ['USD' => 2]
+    );
+    $this->assertTrue($gateway->onNotify($this->request($this->signedPayload()))->isSuccessful());
+  }
+
+  private function assertOrderIsPlacedForTotal(Price $total, int $invoiceAmount, string $currency): void {
     $payload = $this->signedPayload(['invoice' => '17']);
 
     $reepayService = $this->createReepayServiceMock();
     $reepayService->method('getWebhookSecret')->willReturn(self::SECRET);
-    $reepayService->method('getInvoice')->willReturn($this->paidInvoice(['amount' => 3999]));
+    $reepayService->method('getInvoice')->willReturn($this->paidInvoice(['amount' => $invoiceAmount, 'currency' => $currency, 'settled_amount' => $invoiceAmount]));
 
     $orderState = $this->createMock(StateItemInterface::class);
     $orderState->expects($this->once())->method('applyTransitionById')->with('place');
@@ -473,7 +548,7 @@ class ReepayOnNotifyTest extends UnitTestCase {
       ['state', (object) ['value' => 'draft']],
     ]);
     $order->method('getState')->willReturn($orderState);
-    $order->method('getTotalPrice')->willReturn(new Price('39.99', 'USD'));
+    $order->method('getTotalPrice')->willReturn($total);
     $order->method('id')->willReturn(17);
     $order->expects($this->once())->method('save');
 
@@ -495,6 +570,7 @@ class ReepayOnNotifyTest extends UnitTestCase {
     $entityTypeManager->method('getStorage')->willReturnMap([
       ['commerce_order', $orderStorage],
       ['commerce_payment', $paymentStorage],
+      ['commerce_currency', $this->currencyStorage($currencies ?? NULL)],
     ]);
 
     $gateway = $this->createGateway($reepayService, $entityTypeManager);

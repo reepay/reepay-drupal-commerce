@@ -366,7 +366,12 @@ abstract class ReepayGatewayBase extends OffsitePaymentGatewayBase implements Su
       return 'The order has no total.';
     }
 
-    $expectedAmount = ReepayService::toMinorUnits($total);
+    try {
+      $expectedAmount = ReepayService::toMinorUnitsFor($total, $this->entityTypeManager);
+    }
+    catch (PaymentGatewayException $e) {
+      return $e->getMessage();
+    }
     $invoiceAmount = $invoice['amount'] ?? NULL;
     if (!is_int($invoiceAmount) || $invoiceAmount !== $expectedAmount) {
       return sprintf('Amount: order=%d, invoice=%s.', $expectedAmount, is_scalar($invoiceAmount) ? $invoiceAmount : 'missing');
@@ -529,7 +534,7 @@ abstract class ReepayGatewayBase extends OffsitePaymentGatewayBase implements Su
 
   public function capturePayment(PaymentInterface $payment, ?Price $amount = NULL)
   {
-    $paymentAmount = ReepayService::toMinorUnits($amount);
+    $paymentAmount = ReepayService::toMinorUnitsFor($amount, $this->entityTypeManager);
     $configuration = $payment->getPaymentGateway()->getPlugin()->getConfiguration();
 
     if('test' == $configuration['mode']) {
@@ -576,7 +581,7 @@ abstract class ReepayGatewayBase extends OffsitePaymentGatewayBase implements Su
       $payment->setState('refunded');
     }
 
-    $paymentAmount = ReepayService::toMinorUnits($amount);
+    $paymentAmount = ReepayService::toMinorUnitsFor($amount, $this->entityTypeManager);
     $return = $this->reepayService->refund($payment->getRemoteId(), $paymentAmount);
     if('success' == $return['result'] ) {
       $payment->setRefundedAmount($new_refunded_amount);

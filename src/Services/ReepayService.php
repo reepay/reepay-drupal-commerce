@@ -2,12 +2,15 @@
 
 namespace Drupal\commerce_reepay_checkout\Services;
 
+use Drupal\commerce_payment\Exception\PaymentGatewayException;
 use Drupal\commerce_price\Calculator;
+use Drupal\commerce_price\Entity\CurrencyInterface;
 use Drupal\commerce_price\Price;
 use GuzzleHttp\Client;
 use GuzzleHttp\ClientInterface;
 use Drupal\Component\Datetime\TimeInterface;
 use Drupal\Component\Serialization\Json;
+use Drupal\Core\Entity\EntityTypeManagerInterface;
 use GuzzleHttp\Exception\ClientException;
 use Drupal\Core\Cache\CacheBackendInterface;
 use Drupal\Core\Logger\LoggerChannelFactoryInterface;
@@ -102,12 +105,39 @@ class ReepayService
     }
 
   /**
-   * Converts a price to the integer minor units (cents) Frisbii uses.
+   * Converts a price to the integer minor units Frisbii uses.
    *
-   * Keeps the decimals: 39.99 becomes 3999, not 3900.
+   * Frisbii counts an amount in the smallest unit of the currency, so the
+   * factor is 10 to the power of the currency's decimals (USD 2, JPY 0,
+   * KWD 3). Keeps the decimals: 39.99 USD becomes 3999.
    */
-  public static function toMinorUnits(Price $price): int {
-    return (int) Calculator::round(Calculator::multiply($price->getNumber(), '100'), 0);
+  public static function toMinorUnits(Price $price, int $fractionDigits): int {
+    $factor = '1' . str_repeat('0', max(0, $fractionDigits));
+    return (int) Calculator::round(Calculator::multiply($price->getNumber(), $factor), 0);
+  }
+
+  /**
+   * Returns the number of decimals of the currency of a price.
+   *
+   * Fails closed: an unknown currency throws instead of using a default.
+   *
+   * @throws \Drupal\commerce_payment\Exception\PaymentGatewayException
+   */
+  public static function fractionDigitsFor(Price $price, EntityTypeManagerInterface $entityTypeManager): int {
+    $currency = $entityTypeManager->getStorage('commerce_currency')->load($price->getCurrencyCode());
+    if (!$currency instanceof CurrencyInterface) {
+      throw new PaymentGatewayException(sprintf('The currency %s is not available in Commerce.', $price->getCurrencyCode()));
+    }
+    return (int) $currency->getFractionDigits();
+  }
+
+  /**
+   * Converts a price to Frisbii minor units using its currency's decimals.
+   *
+   * @throws \Drupal\commerce_payment\Exception\PaymentGatewayException
+   */
+  public static function toMinorUnitsFor(Price $price, EntityTypeManagerInterface $entityTypeManager): int {
+    return self::toMinorUnits($price, self::fractionDigitsFor($price, $entityTypeManager));
   }
 
   /**

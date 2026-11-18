@@ -2,10 +2,14 @@
 
 namespace Drupal\Tests\commerce_reepay_checkout\Unit;
 
+use Drupal\commerce_payment\Exception\PaymentGatewayException;
+use Drupal\commerce_price\Entity\CurrencyInterface;
 use Drupal\commerce_price\Price;
 use Drupal\commerce_reepay_checkout\Services\ReepayService;
 use Drupal\Component\Datetime\TimeInterface;
 use Drupal\Core\Cache\CacheBackendInterface;
+use Drupal\Core\Entity\EntityStorageInterface;
+use Drupal\Core\Entity\EntityTypeManagerInterface;
 use Drupal\Core\Logger\LoggerChannelFactoryInterface;
 use Drupal\Core\Logger\LoggerChannelInterface;
 use Drupal\Tests\UnitTestCase;
@@ -119,17 +123,42 @@ class ReepayServiceTest extends UnitTestCase {
 
   public static function minorUnitsProvider(): array {
     return [
-      'whole amount' => ['39.00', 3900],
-      'cents are kept' => ['39.99', 3999],
-      'single cent' => ['0.01', 1],
-      'rounds half up' => ['10.005', 1001],
-      'zero' => ['0', 0],
+      'whole amount' => ['39.00', 'USD', 2, 3900],
+      'cents are kept' => ['39.99', 'USD', 2, 3999],
+      'single cent' => ['0.01', 'USD', 2, 1],
+      'rounds half up' => ['10.005', 'USD', 2, 1001],
+      'zero' => ['0', 'USD', 2, 0],
+      'zero decimals' => ['1000', 'JPY', 0, 1000],
+      'zero decimals, small amount' => ['199', 'JPY', 0, 199],
+      'three decimals' => ['1.234', 'KWD', 3, 1234],
+      'three decimals, whole amount' => ['2', 'KWD', 3, 2000],
     ];
   }
 
   #[DataProvider('minorUnitsProvider')]
-  public function testToMinorUnitsKeepsTheDecimals(string $number, int $expected): void {
-    $this->assertSame($expected, ReepayService::toMinorUnits(new Price($number, 'USD')));
+  public function testToMinorUnitsFollowsTheCurrencyDecimals(string $number, string $currency, int $digits, int $expected): void {
+    $this->assertSame($expected, ReepayService::toMinorUnits(new Price($number, $currency), $digits));
+  }
+
+  public function testToMinorUnitsForLoadsTheDecimalsFromCommerce(): void {
+    $currency = $this->createMock(CurrencyInterface::class);
+    $currency->method('getFractionDigits')->willReturn(0);
+    $storage = $this->createMock(EntityStorageInterface::class);
+    $storage->expects($this->once())->method('load')->with('JPY')->willReturn($currency);
+    $entityTypeManager = $this->createMock(EntityTypeManagerInterface::class);
+    $entityTypeManager->method('getStorage')->with('commerce_currency')->willReturn($storage);
+
+    $this->assertSame(1000, ReepayService::toMinorUnitsFor(new Price('1000', 'JPY'), $entityTypeManager));
+  }
+
+  public function testUnknownCurrencyFailsInsteadOfUsingTwoDecimals(): void {
+    $storage = $this->createMock(EntityStorageInterface::class);
+    $storage->method('load')->willReturn(NULL);
+    $entityTypeManager = $this->createMock(EntityTypeManagerInterface::class);
+    $entityTypeManager->method('getStorage')->with('commerce_currency')->willReturn($storage);
+
+    $this->expectException(PaymentGatewayException::class);
+    ReepayService::toMinorUnitsFor(new Price('39.00', 'USD'), $entityTypeManager);
   }
 
 }
