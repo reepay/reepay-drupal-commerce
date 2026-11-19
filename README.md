@@ -30,7 +30,7 @@ To add it: **Commerce > Configuration > Payment gateways > Add payment gateway**
 Note that credentials are **not shared** between separate payment gateway entities — if you already filled in your Frisbii Private keys on "Frisbii Payments", you need to enter them again here. Each payment gateway added from **Add payment gateway** is its own independent configuration, even when pointed at the same Frisbii account.
 
 ## Changelog (Latest Release)
-v 1.1.0
+v 1.1.1
 - [Fix] - Payment improvements.
 - [Fix] - Frisbii webhook authentication with HMAC-SHA256
 - [Feature] - Supports Visa & Mastercard Click-to-pay.

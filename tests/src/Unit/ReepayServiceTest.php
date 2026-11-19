@@ -161,6 +161,30 @@ class ReepayServiceTest extends UnitTestCase {
   }
 
   /**
+   * FD-14: an event id is remembered for the full Frisbii retry period.
+   */
+  public function testMarkWebhookEventProcessedStoresTheIdForTheRetryPeriod(): void {
+    $cache = $this->createMock(CacheBackendInterface::class);
+    $cache->expects($this->once())->method('set')->with(
+      ReepayService::WEBHOOK_EVENT_CACHE_ID_PREFIX . 'evt_1',
+      TRUE,
+      1000000 + ReepayService::WEBHOOK_EVENT_CACHE_TTL
+    );
+
+    $this->createService($this->createMock(ClientInterface::class), $cache, 1000000)->markWebhookEventProcessed('evt_1');
+  }
+
+  public function testIsWebhookEventProcessedIsTrueOnlyForARememberedId(): void {
+    $cache = $this->createMock(CacheBackendInterface::class);
+    $cache->method('get')->willReturnCallback(fn ($id) => $id === ReepayService::WEBHOOK_EVENT_CACHE_ID_PREFIX . 'seen' ? (object) ['data' => TRUE] : FALSE);
+
+    $service = $this->createService($this->createMock(ClientInterface::class), $cache);
+
+    $this->assertTrue($service->isWebhookEventProcessed('seen'));
+    $this->assertFalse($service->isWebhookEventProcessed('new'));
+  }
+
+  /**
    * The outgoing payload keeps the customer and billing_address, but the
    * copy written to the log has both replaced, since name/email/address
    * has no place accumulating in watchdog.

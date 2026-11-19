@@ -1,5 +1,5 @@
 ## Changelog
-v 1.1.0
+v 1.1.1
 - [Fix] - Payment improvements.
 - [Fix] - Frisbii webhook authentication with HMAC-SHA256
 - [Feature] - Supports Visa & Mastercard Click-to-pay.

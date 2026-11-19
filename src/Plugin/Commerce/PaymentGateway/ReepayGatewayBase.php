@@ -228,6 +228,34 @@ abstract class ReepayGatewayBase extends OffsitePaymentGatewayBase implements Su
    */
   private const NOTIFY_REQUIRED_FIELDS = ['timestamp', 'id', 'signature', 'event_type', 'invoice'];
 
+  /**
+   * Oldest webhook accepted, in seconds.
+   *
+   * Frisbii retries a failed webhook for up to three days (24 hours on test
+   * accounts) and resends the original signature, so a legitimate retry can
+   * be days old. One hour of slack is added on top of the three days.
+   */
+  private const NOTIFY_MAX_AGE = 262800;
+
+  /**
+   * How far ahead of this server a webhook timestamp may be, in seconds.
+   */
+  private const NOTIFY_MAX_CLOCK_SKEW = 300;
+
+  /**
+   * Age under which a webhook for a draft order is answered with a retry.
+   *
+   * The customer is probably returning to the shop right now, and onReturn()
+   * places the order. Answering "try again later" replaces the old fixed
+   * sleep: no PHP worker waits, and Frisbii sends the event again.
+   */
+  private const NOTIFY_RETURN_GRACE = 30;
+
+  /**
+   * Seconds Frisbii is asked to wait before it sends a deferred webhook again.
+   */
+  private const NOTIFY_RETRY_AFTER = 120;
+
   public function onNotify(Request $request)
   {
     $decoded_result = Json::decode($request->getContent());
@@ -268,6 +296,53 @@ abstract class ReepayGatewayBase extends OffsitePaymentGatewayBase implements Su
       '@invoice' => $invoice,
     ]);
 
+    // Frisbii documents that the signature does not stop replays, so each
+    // event id is handled once. Checked before any other work.
+    if ($this->reepayService->isWebhookEventProcessed($eventId)) {
+      $this->reepayService->logWebhookEvent('Skipped: event id=@id was already processed (invoice=@invoice).', [
+        '@id' => $eventId,
+        '@invoice' => $invoice,
+      ]);
+      return new Response();
+    }
+
+    $eventTime = self::parseEventTimestamp((string) $decoded_result['timestamp']);
+    $now = $this->time->getRequestTime();
+    if ($eventTime === NULL || $now - $eventTime > self::NOTIFY_MAX_AGE || $eventTime - $now > self::NOTIFY_MAX_CLOCK_SKEW) {
+      $this->reepayService->logWebhookEvent('Rejected: timestamp is invalid or outside the accepted window. id=@id, invoice=@invoice', [
+        '@id' => $eventId,
+        '@invoice' => $invoice,
+      ], 'warning');
+      return new Response('', 400);
+    }
+
+    $response = $this->processNotification($decoded_result, $eventTime);
+
+    // A deferred event (503) must stay open so Frisbii's retry is handled.
+    if ($response->getStatusCode() !== 503) {
+      $this->reepayService->markWebhookEventProcessed($eventId);
+    }
+
+    return $response;
+  }
+
+  /**
+   * Handles a webhook whose signature, id and timestamp are already checked.
+   *
+   * Never waits: the order state decides at once whether to act, skip, or ask
+   * Frisbii to send the event again later.
+   *
+   * @param array $data
+   *   The decoded, verified webhook payload.
+   * @param int $eventTime
+   *   The event timestamp as a Unix time.
+   */
+  private function processNotification(array $data, int $eventTime): Response {
+    $eventType = $data['event_type'];
+    $eventId = $data['id'];
+    $invoice = $data['invoice'];
+    $mode = $this->configuration['mode'] ?? 'test';
+
     if (!in_array($eventType, self::NOTIFY_EVENT_TYPES, TRUE)) {
       $this->reepayService->logWebhookEvent('Skipped: event_type=@event_type is not handled. id=@id, invoice=@invoice', [
         '@event_type' => $eventType,
@@ -276,10 +351,6 @@ abstract class ReepayGatewayBase extends OffsitePaymentGatewayBase implements Su
       ]);
       return new Response();
     }
-
-    // Only a verified, handled event reaches this point. The delay lets
-    // onReturn() place the order first; unauthenticated requests never wait.
-    $this->sleepBeforeNotifyProcessing();
 
     $invoice_handle = $invoice;
 
@@ -299,6 +370,17 @@ abstract class ReepayGatewayBase extends OffsitePaymentGatewayBase implements Su
         '@invoice' => $invoice,
       ]);
       return new Response();
+    }
+
+    // The order is still a draft. If the event is brand new, the customer is
+    // most likely coming back to the shop right now and onReturn() places the
+    // order. Ask Frisbii to send the event again instead of waiting here.
+    if ($this->time->getRequestTime() - $eventTime < self::NOTIFY_RETURN_GRACE) {
+      $this->reepayService->logWebhookEvent('Deferred: order_id=@order_id (invoice=@invoice) is still a draft and the event is new. Frisbii will send it again.', [
+        '@order_id' => $order->id(),
+        '@invoice' => $invoice,
+      ]);
+      return new Response('', 503, ['Retry-After' => (string) self::NOTIFY_RETRY_AFTER]);
     }
 
     // Fail closed: confirm payment with Frisbii before the order is placed.
@@ -458,11 +540,24 @@ abstract class ReepayGatewayBase extends OffsitePaymentGatewayBase implements Su
   }
 
   /**
-   * Wraps the notify-processing delay so tests can bypass it.
+   * Converts a Frisbii webhook timestamp to a Unix time.
+   *
+   * Frisbii sends ISO 8601 in UTC, for example 2025-11-11T13:19:18.99Z. A
+   * plain Unix time is accepted too. Anything else returns NULL.
    */
-  protected function sleepBeforeNotifyProcessing(): void {
-    // waiting for onReturn to place an order first
-    sleep(15);
+  private static function parseEventTimestamp(string $timestamp): ?int {
+    if (ctype_digit($timestamp)) {
+      return (int) $timestamp;
+    }
+    if (!preg_match('/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$/', $timestamp)) {
+      return NULL;
+    }
+    try {
+      return (new \DateTimeImmutable($timestamp))->getTimestamp();
+    }
+    catch (\Exception $e) {
+      return NULL;
+    }
   }
 
   /**

@@ -28,6 +28,18 @@ class ReepayService
   const WEBHOOK_SECRET_CACHE_ID_PREFIX = 'commerce_reepay_checkout:webhook_secret:';
 
   /**
+   * The cache ID prefix used to remember handled webhook event ids.
+   */
+  const WEBHOOK_EVENT_CACHE_ID_PREFIX = 'commerce_reepay_checkout:webhook_event:';
+
+  /**
+   * How long a handled event id is remembered, in seconds.
+   *
+   * Frisbii retries for up to three days; one hour of slack on top.
+   */
+  const WEBHOOK_EVENT_CACHE_TTL = 262800;
+
+  /**
    * How long to wait between forced refreshes of the webhook secret that
    * were triggered by a signature mismatch, in seconds.
    *
@@ -259,6 +271,24 @@ class ReepayService
     $this->cache->set($cacheId, $result_decoded['secret'], $this->time->getRequestTime() + self::WEBHOOK_SECRET_CACHE_TTL);
 
     return $result_decoded['secret'];
+  }
+
+  /**
+   * Tells whether a webhook event id was already handled.
+   */
+  public function isWebhookEventProcessed(string $eventId): bool
+  {
+    return (bool) $this->cache->get(self::WEBHOOK_EVENT_CACHE_ID_PREFIX . $eventId);
+  }
+
+  /**
+   * Remembers a handled webhook event id, so a replay does nothing.
+   *
+   * Kept for the full time Frisbii may retry an event.
+   */
+  public function markWebhookEventProcessed(string $eventId): void
+  {
+    $this->cache->set(self::WEBHOOK_EVENT_CACHE_ID_PREFIX . $eventId, TRUE, $this->time->getRequestTime() + self::WEBHOOK_EVENT_CACHE_TTL);
   }
 
   /**
