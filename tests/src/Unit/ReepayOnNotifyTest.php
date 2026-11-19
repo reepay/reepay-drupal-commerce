@@ -5,6 +5,8 @@ namespace Drupal\Tests\commerce_reepay_checkout\Unit;
 use Drupal\commerce_order\Entity\OrderInterface;
 use Drupal\commerce_payment\Entity\PaymentGatewayInterface;
 use Drupal\commerce_payment\Entity\PaymentInterface;
+use Drupal\commerce_payment\Exception\PaymentGatewayException;
+use Drupal\commerce_payment\Plugin\Commerce\PaymentGateway\PaymentGatewayInterface as PaymentGatewayPluginInterface;
 use Drupal\commerce_price\Entity\CurrencyInterface;
 use Drupal\commerce_price\Price;
 use Drupal\commerce_reepay_checkout\Plugin\Commerce\PaymentGateway\ReepayGatewayBase;
@@ -12,6 +14,7 @@ use Drupal\commerce_reepay_checkout\Services\ReepayService;
 use Drupal\Component\Datetime\TimeInterface;
 use Drupal\Core\Entity\EntityStorageInterface;
 use Drupal\Core\Entity\EntityTypeManagerInterface;
+use Drupal\Core\Lock\LockBackendInterface;
 use Drupal\Tests\UnitTestCase;
 use Drupal\state_machine\Plugin\Field\FieldType\StateItemInterface;
 use Drupal\state_machine\Plugin\Workflow\WorkflowInterface;
@@ -27,6 +30,8 @@ use Symfony\Component\HttpFoundation\Request;
 class ReepayOnNotifyTest extends UnitTestCase {
 
   private const SECRET = 'whsec_test_secret';
+  private const EVENT_TIME = '2023-11-14T22:11:20.000Z';
+  private const REQUEST_TIME_ISO = '2023-11-14T22:13:20.000Z';
 
   /**
    * The payment gateway config entity ID used by createGateway()'s mock
@@ -38,9 +43,8 @@ class ReepayOnNotifyTest extends UnitTestCase {
   /**
    * Builds a Reepay gateway plugin instance with mocked collaborators.
    *
-   * The 15-second delay at the top of onNotify() is stubbed out so tests
-   * run instantly; every other collaborator is injected via reflection
-   * since the plugin has no public setters for them.
+   * Every collaborator is injected via reflection, since the plugin has no
+   * public setters for them.
    */
   private function createGateway(ReepayService $reepayService, ?EntityTypeManagerInterface $entityTypeManager = NULL, ?EventDispatcherInterface $eventDispatcher = NULL, ?string $gatewayId = self::GATEWAY_ID): ReepayGatewayBase {
     $configuration = [
@@ -52,7 +56,7 @@ class ReepayOnNotifyTest extends UnitTestCase {
     /** @var \Drupal\commerce_reepay_checkout\Plugin\Commerce\PaymentGateway\Reepay $gateway */
     $gateway = $this->getMockBuilder(ReepayGatewayBase::class)
       ->setConstructorArgs([$configuration, 'reepay_checkout', []])
-      ->onlyMethods(['sleepBeforeNotifyProcessing', 'getReepayPaymentMethods'])
+      ->onlyMethods(['getReepayPaymentMethods'])
       ->getMock();
 
     $time = $this->createMock(TimeInterface::class);
@@ -62,6 +66,9 @@ class ReepayOnNotifyTest extends UnitTestCase {
     $this->setInaccessibleProperty($gateway, 'entityTypeManager', $entityTypeManager ?? $this->createMock(EntityTypeManagerInterface::class));
     $this->setInaccessibleProperty($gateway, 'eventDispatcher', $eventDispatcher ?? $this->createMock(EventDispatcherInterface::class));
     $this->setInaccessibleProperty($gateway, 'time', $time);
+    $lock = $this->createMock(LockBackendInterface::class);
+    $lock->method('acquire')->willReturn(TRUE);
+    $this->setInaccessibleProperty($gateway, 'lock', $lock);
 
     // Leaving $gatewayId NULL mimics the one call path where parentEntity
     // is genuinely unavailable (see buildNotifyUrlFromFormState()'s
@@ -89,8 +96,24 @@ class ReepayOnNotifyTest extends UnitTestCase {
     return $this->createMock(ReepayService::class);
   }
 
+  /**
+   * Same as signedPayload(), but signed for a chosen timestamp.
+   */
+  private function signedPayloadAt(string $timestamp, array $overrides = []): array {
+    $id = 'evt_123';
+    return array_merge([
+      'timestamp' => $timestamp,
+      'id' => $id,
+      'signature' => hash_hmac('sha256', $timestamp . $id, self::SECRET),
+      'event_type' => 'invoice_authorized',
+      'invoice' => '17',
+    ], $overrides);
+  }
+
   private function signedPayload(array $overrides = []): array {
-    $timestamp = '1700000000';
+    // Two minutes before the mocked request time (1700000000): old enough
+    // that a draft order is processed at once, new enough to be accepted.
+    $timestamp = self::EVENT_TIME;
     $id = 'evt_123';
     $signature = hash_hmac('sha256', $timestamp . $id, self::SECRET);
 
@@ -168,7 +191,7 @@ class ReepayOnNotifyTest extends UnitTestCase {
   public function testSecretRotationRetriesOnceThenSucceeds(): void {
     $rotatedSecret = 'whsec_rotated_secret';
     $payload = $this->signedPayload([
-      'signature' => hash_hmac('sha256', '1700000000evt_123', $rotatedSecret),
+      'signature' => hash_hmac('sha256', self::EVENT_TIME . 'evt_123', $rotatedSecret),
       'event_type' => 'invoice_refund',
     ]);
 
@@ -393,10 +416,24 @@ class ReepayOnNotifyTest extends UnitTestCase {
     $this->assertTrue($response->isSuccessful());
   }
 
-  public function testMissingInvoiceDataDoesNotPlaceOrder(): void {
-    [$gateway] = $this->notifyGatewayForUnplacedOrder(NULL);
+  /**
+   * FD-15: a failed or slow Frisbii call is deferred (503) and the event id is
+   * not stored, so Frisbii's retry is handled.
+   */
+  public function testFailedInvoiceCallIsDeferredAndNotMarkedProcessed(): void {
+    [$gateway, $reepayService] = $this->notifyGatewayForUnplacedOrder(NULL);
+    $reepayService->expects($this->never())->method('markWebhookEventProcessed');
     $response = $gateway->onNotify($this->request($this->signedPayload()));
-    $this->assertTrue($response->isSuccessful());
+    $this->assertSame(503, $response->getStatusCode());
+    $this->assertSame('120', $response->headers->get('Retry-After'));
+  }
+
+  /**
+   * FD-15: the return waits longer than the HTTP timeout for the order lock.
+   */
+  public function testReturnLockWaitIsLongerThanTheHttpTimeout(): void {
+    $wait = (new \ReflectionClassConstant(ReepayGatewayBase::class, 'ORDER_LOCK_WAIT'))->getValue();
+    $this->assertGreaterThan(ReepayService::HTTP_TIMEOUT, $wait);
   }
 
   public function testMissingPaymentEntityDoesNotPlaceOrder(): void {
@@ -671,18 +708,201 @@ class ReepayOnNotifyTest extends UnitTestCase {
     $this->assertTrue($gateway->onNotify($this->request($payload))->isSuccessful());
   }
 
-  public function testInvalidSignatureDoesNotWait(): void {
+  /**
+   * FD-14: the handler never waits, so a bad signature is answered at once
+   * and no event lookup happens for it.
+   */
+  public function testInvalidSignatureIsRejectedBeforeAnyEventLookup(): void {
     $reepayService = $this->createReepayServiceMock();
     $reepayService->method('getWebhookSecret')->willReturn(self::SECRET);
-    $gateway = $this->getMockBuilder(ReepayGatewayBase::class)
-      ->setConstructorArgs([['mode' => 'test', 'test_private_key' => 'k', 'live_private_key' => 'k'], 'reepay_checkout', []])
-      ->onlyMethods(['sleepBeforeNotifyProcessing', 'getReepayPaymentMethods'])
-      ->getMock();
-    $gateway->expects($this->never())->method('sleepBeforeNotifyProcessing');
-    $this->setInaccessibleProperty($gateway, 'reepayService', $reepayService);
+    $reepayService->expects($this->never())->method('isWebhookEventProcessed');
+    $reepayService->expects($this->never())->method('markWebhookEventProcessed');
+    $gateway = $this->createGateway($reepayService);
 
     $response = $gateway->onNotify($this->request($this->signedPayload(['signature' => 'bad'])));
     $this->assertSame(403, $response->getStatusCode());
+  }
+
+  /**
+   * FD-14: a brand-new event for a draft order is deferred, not slept on.
+   */
+  public function testNewEventForDraftOrderIsDeferredWithRetryAfter(): void {
+    [$gateway, $reepayService] = $this->notifyGatewayForUnplacedOrder(NULL, TRUE, 17, FALSE);
+    $reepayService->expects($this->never())->method('markWebhookEventProcessed');
+
+    $response = $gateway->onNotify($this->request($this->signedPayloadAt(self::REQUEST_TIME_ISO)));
+
+    $this->assertSame(503, $response->getStatusCode());
+    $this->assertSame('120', $response->headers->get('Retry-After'));
+  }
+
+  /**
+   * FD-14: the same event id is handled once; a replay does nothing.
+   */
+  public function testReplayedEventIdDoesNothing(): void {
+    [$gateway, $reepayService] = $this->notifyGatewayForUnplacedOrder(NULL, TRUE, 17, FALSE);
+    $reepayService->method('isWebhookEventProcessed')->with('evt_123')->willReturn(TRUE);
+    $reepayService->expects($this->never())->method('markWebhookEventProcessed');
+
+    $response = $gateway->onNotify($this->request($this->signedPayload()));
+
+    $this->assertSame(200, $response->getStatusCode());
+  }
+
+  /**
+   * A finished event is remembered, so that a replay is recognised.
+   */
+  public function testHandledEventIsMarkedAsProcessed(): void {
+    [$gateway, $reepayService] = $this->notifyGatewayForUnplacedOrder($this->paidInvoice(['state' => 'created']));
+    $reepayService->expects($this->once())->method('markWebhookEventProcessed')->with('evt_123');
+
+    $response = $gateway->onNotify($this->request($this->signedPayload()));
+
+    $this->assertSame(200, $response->getStatusCode());
+  }
+
+  public static function badTimestampProvider(): array {
+    return [
+      'one year old' => ['2022-11-14T22:13:20.000Z'],
+      'far in the future' => ['2023-11-14T23:13:20.000Z'],
+      'not a time' => ['tomorrow'],
+      'date only' => ['2023-11-14'],
+    ];
+  }
+
+  /**
+   * FD-14: a correctly signed webhook with an unusable timestamp is refused
+   * before any order or invoice work.
+   */
+  #[DataProvider('badTimestampProvider')]
+  public function testTimestampOutsideTheWindowIsRejected(string $timestamp): void {
+    [$gateway, $reepayService] = $this->notifyGatewayForUnplacedOrder(NULL, TRUE, 17, FALSE);
+    $reepayService->expects($this->never())->method('markWebhookEventProcessed');
+
+    $response = $gateway->onNotify($this->request($this->signedPayloadAt($timestamp)));
+
+    $this->assertSame(400, $response->getStatusCode());
+  }
+
+  /**
+   * A retry from Frisbii keeps the original signature and may be days old.
+   */
+  public function testTwoDayOldRetryIsStillProcessed(): void {
+    [$gateway, $reepayService] = $this->notifyGatewayForUnplacedOrder($this->paidInvoice(['state' => 'created']));
+    $reepayService->expects($this->once())->method('markWebhookEventProcessed');
+
+    $response = $gateway->onNotify($this->request($this->signedPayloadAt('2023-11-12T22:13:20.000Z')));
+
+    $this->assertSame(200, $response->getStatusCode());
+  }
+
+  public function testUnixTimestampIsAccepted(): void {
+    [$gateway] = $this->notifyGatewayForUnplacedOrder($this->paidInvoice(['state' => 'created']));
+
+    $response = $gateway->onNotify($this->request($this->signedPayloadAt('1699999880')));
+
+    $this->assertSame(200, $response->getStatusCode());
+  }
+
+  /**
+   * FD-15: when the order lock is taken the webhook is deferred, not run.
+   */
+  public function testWebhookIsDeferredWhileTheOrderLockIsTaken(): void {
+    [$gateway, $reepayService] = $this->notifyGatewayForUnplacedOrder(NULL, TRUE, 17, FALSE);
+    $lock = $this->createMock(LockBackendInterface::class);
+    $lock->expects($this->once())->method('acquire')->with('commerce_reepay_checkout:order:17')->willReturn(FALSE);
+    $lock->expects($this->never())->method('release');
+    $this->setInaccessibleProperty($gateway, 'lock', $lock);
+    $reepayService->expects($this->never())->method('markWebhookEventProcessed');
+
+    $response = $gateway->onNotify($this->request($this->signedPayloadAt(self::EVENT_TIME)));
+
+    $this->assertSame(503, $response->getStatusCode());
+    $this->assertSame('120', $response->headers->get('Retry-After'));
+  }
+
+  /**
+   * FD-15: the order lock is always released after the webhook.
+   */
+  public function testOrderLockIsReleasedAfterTheWebhook(): void {
+    [$gateway] = $this->notifyGatewayForUnplacedOrder($this->paidInvoice(['state' => 'created']));
+    $lock = $this->createMock(LockBackendInterface::class);
+    $lock->method('acquire')->willReturn(TRUE);
+    $lock->expects($this->once())->method('release')->with('commerce_reepay_checkout:order:17');
+    $this->setInaccessibleProperty($gateway, 'lock', $lock);
+
+    $gateway->onNotify($this->request($this->signedPayloadAt(self::EVENT_TIME)));
+  }
+
+  /**
+   * FD-15: an invoice value that is not a plain handle never reaches the API.
+   */
+  #[DataProvider('badInvoiceHandleProvider')]
+  public function testReturnWithUnsafeInvoiceHandleIsRejectedBeforeAnyApiCall(string $invoice): void {
+    $reepayService = $this->createReepayServiceMock();
+    $reepayService->expects($this->never())->method('getInvoice');
+    $gateway = $this->createGateway($reepayService);
+    $order = $this->createMock(OrderInterface::class);
+    $order->method('id')->willReturn(17);
+
+    $this->expectException(PaymentGatewayException::class);
+    $gateway->onReturn($order, new Request(['invoice' => $invoice]));
+  }
+
+  public static function badInvoiceHandleProvider(): array {
+    return [
+      'dot dot segments' => ['17-/../../account/webhook_settings'],
+      'query string' => ['17-?x=1'],
+      'fragment' => ['17-#y'],
+      'percent sign' => ['17-%2F..'],
+      'space' => ['17- 5'],
+      'empty' => [''],
+    ];
+  }
+
+  private function paymentToCapture(string $state): PaymentInterface {
+    $paymentState = $this->createMock(StateItemInterface::class);
+    $paymentState->method('getId')->willReturn($state);
+    $plugin = $this->createMock(PaymentGatewayPluginInterface::class);
+    $plugin->method('getConfiguration')->willReturn(['mode' => 'test', 'test_private_key' => 'k', 'live_private_key' => 'l']);
+    $gatewayEntity = $this->createMock(PaymentGatewayInterface::class);
+    $gatewayEntity->method('getPlugin')->willReturn($plugin);
+    $payment = $this->createMock(PaymentInterface::class);
+    $payment->method('getState')->willReturn($paymentState);
+    $payment->method('getPaymentGateway')->willReturn($gatewayEntity);
+    $payment->method('getRemoteId')->willReturn('17');
+    $payment->method('getAmount')->willReturn(new Price('39.00', 'USD'));
+    return $payment;
+  }
+
+  /**
+   * FD-15: only an authorization can be captured.
+   */
+  public function testCaptureOfAPaymentThatIsNotAnAuthorizationIsRefused(): void {
+    $reepayService = $this->createReepayServiceMock();
+    $reepayService->expects($this->never())->method('settle');
+    $gateway = $this->createGateway($reepayService);
+
+    $this->expectException(\InvalidArgumentException::class);
+    $gateway->capturePayment($this->paymentToCapture('completed'), new Price('39.00', 'USD'));
+  }
+
+  /**
+   * FD-15: no amount means the full payment amount, not a PHP error.
+   */
+  public function testCaptureWithoutAmountUsesThePaymentAmount(): void {
+    $reepayService = $this->createReepayServiceMock();
+    $reepayService->expects($this->once())->method('settle')->with('17', 3900)->willReturn(['result' => 'success']);
+    $entityTypeManager = $this->createMock(EntityTypeManagerInterface::class);
+    $entityTypeManager->method('getStorage')->willReturnMap([
+      ['commerce_currency', $this->currencyStorage(NULL)],
+    ]);
+    $gateway = $this->createGateway($reepayService, $entityTypeManager);
+    $payment = $this->paymentToCapture('authorization');
+    $payment->expects($this->once())->method('setState')->with('completed');
+    $payment->expects($this->once())->method('save');
+
+    $gateway->capturePayment($payment, NULL);
   }
 
 }

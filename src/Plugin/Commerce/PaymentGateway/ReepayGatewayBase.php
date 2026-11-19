@@ -16,6 +16,7 @@ use Drupal\commerce_reepay_checkout\Services\ReepayService;
 use Drupal\Component\Serialization\Json;
 use Drupal\Core\Entity\EntityFormInterface;
 use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\Lock\LockBackendInterface;
 use Drupal\Core\Url;
 use Drupal\language\ConfigurableLanguageManagerInterface;
 use Symfony\Component\DependencyInjection\ContainerInterface;
@@ -50,6 +51,26 @@ abstract class ReepayGatewayBase extends OffsitePaymentGatewayBase implements Su
   private $eventDispatcher;
 
   /**
+   * Lock service, used so only one process handles an order at a time.
+   *
+   * @var \Drupal\Core\Lock\LockBackendInterface
+   */
+  protected $lock;
+
+  /**
+   * Seconds a process may hold the lock of one order.
+   */
+  private const ORDER_LOCK_TIMEOUT = 30.0;
+
+  /**
+   * Seconds onReturn() waits for a lock that onNotify() holds.
+   *
+   * Longer than the HTTP timeout, because onNotify() holds the lock while it
+   * asks Frisbii for the invoice (one call, at most HTTP_TIMEOUT seconds).
+   */
+  private const ORDER_LOCK_WAIT = ReepayService::HTTP_TIMEOUT + 5;
+
+  /**
    * The Frisbii API payment method value(s) this gateway sends.
    *
    * @return string[]
@@ -64,6 +85,7 @@ abstract class ReepayGatewayBase extends OffsitePaymentGatewayBase implements Su
     $instance = parent::create($container, $configuration, $plugin_id, $plugin_definition);
     $instance->reepayService = $container->get('commerce_reepay_checkout.reepay_service');
     $instance->eventDispatcher = $container->get('event_dispatcher');
+    $instance->lock = $container->get('lock');
 
     return $instance;
   }
@@ -142,6 +164,15 @@ abstract class ReepayGatewayBase extends OffsitePaymentGatewayBase implements Su
          $orderHandle =  substr($orderHandle, 0, $pos);
     }
 
+    // The handle goes into Frisbii API URLs, so only plain characters are
+    // accepted (an order id, or an order id with a suffix after a dash).
+    if (!self::isValidInvoiceHandle($invoiceHandle)) {
+      $this->reepayService->logWebhookEvent('Return rejected: invoice handle has invalid characters. order_id=@order_id', [
+        '@order_id' => $order->id(),
+      ], 'warning');
+      throw new PaymentGatewayException('The invoice does not belong to this order.');
+    }
+
     // The invoice must belong to the order that is being checked out.
     if ($orderHandle === '' || $orderHandle !== (string) $order->id()) {
       $this->reepayService->logWebhookEvent('Return rejected: invoice=@invoice does not match order_id=@order_id.', [
@@ -151,6 +182,47 @@ abstract class ReepayGatewayBase extends OffsitePaymentGatewayBase implements Su
       throw new PaymentGatewayException('The invoice does not belong to this order.');
     }
 
+    // Only one process may confirm this order's payment at a time. If
+    // onNotify() holds the lock it is short, so wait for it a little.
+    $lockName = self::orderLockName((string) $order->id());
+    if (!$this->lock->acquire($lockName, self::ORDER_LOCK_TIMEOUT)) {
+      $this->lock->wait($lockName, self::ORDER_LOCK_WAIT);
+      if (!$this->lock->acquire($lockName, self::ORDER_LOCK_TIMEOUT)) {
+        $this->reepayService->logWebhookEvent('Return rejected: order_id=@order_id is being processed by another request.', [
+          '@order_id' => $order->id(),
+        ], 'warning');
+        throw new PaymentGatewayException('The order is being processed. Please try again.');
+      }
+    }
+
+    try {
+      $this->confirmReturnedPayment($order, $invoiceHandle, $orderHandle);
+    }
+    finally {
+      $this->lock->release($lockName);
+    }
+  }
+
+  /**
+   * Name of the lock that serialises work on one order.
+   */
+  private static function orderLockName(string $orderId): string {
+    return 'commerce_reepay_checkout:order:' . $orderId;
+  }
+
+  /**
+   * Whether an invoice handle only has characters that are safe in a URL.
+   */
+  private static function isValidInvoiceHandle(string $handle): bool {
+    return (bool) preg_match('/^[A-Za-z0-9_-]+$/', $handle);
+  }
+
+  /**
+   * Confirms with Frisbii that the returned payment is paid, and saves it.
+   *
+   * Runs while the order lock is held (see onReturn()).
+   */
+  private function confirmReturnedPayment(OrderInterface $order, string $invoiceHandle, string $orderHandle): void {
     $gatewayId = $this->currentGatewayId();
     if ($gatewayId === NULL) {
       $this->reepayService->logWebhookEvent('Return rejected: could not determine the payment gateway for order_id=@order_id.', [
@@ -228,6 +300,34 @@ abstract class ReepayGatewayBase extends OffsitePaymentGatewayBase implements Su
    */
   private const NOTIFY_REQUIRED_FIELDS = ['timestamp', 'id', 'signature', 'event_type', 'invoice'];
 
+  /**
+   * Oldest webhook accepted, in seconds.
+   *
+   * Frisbii retries a failed webhook for up to three days (24 hours on test
+   * accounts) and resends the original signature, so a legitimate retry can
+   * be days old. One hour of slack is added on top of the three days.
+   */
+  private const NOTIFY_MAX_AGE = 262800;
+
+  /**
+   * How far ahead of this server a webhook timestamp may be, in seconds.
+   */
+  private const NOTIFY_MAX_CLOCK_SKEW = 300;
+
+  /**
+   * Age under which a webhook for a draft order is answered with a retry.
+   *
+   * The customer is probably returning to the shop right now, and onReturn()
+   * places the order. Answering "try again later" replaces the old fixed
+   * sleep: no PHP worker waits, and Frisbii sends the event again.
+   */
+  private const NOTIFY_RETURN_GRACE = 30;
+
+  /**
+   * Seconds Frisbii is asked to wait before it sends a deferred webhook again.
+   */
+  private const NOTIFY_RETRY_AFTER = 120;
+
   public function onNotify(Request $request)
   {
     $decoded_result = Json::decode($request->getContent());
@@ -268,6 +368,73 @@ abstract class ReepayGatewayBase extends OffsitePaymentGatewayBase implements Su
       '@invoice' => $invoice,
     ]);
 
+    // Frisbii documents that the signature does not stop replays, so each
+    // event id is handled once. Checked before any other work.
+    if ($this->reepayService->isWebhookEventProcessed($eventId)) {
+      $this->reepayService->logWebhookEvent('Skipped: event id=@id was already processed (invoice=@invoice).', [
+        '@id' => $eventId,
+        '@invoice' => $invoice,
+      ]);
+      return new Response();
+    }
+
+    $eventTime = self::parseEventTimestamp((string) $decoded_result['timestamp']);
+    $now = $this->time->getRequestTime();
+    if ($eventTime === NULL || $now - $eventTime > self::NOTIFY_MAX_AGE || $eventTime - $now > self::NOTIFY_MAX_CLOCK_SKEW) {
+      $this->reepayService->logWebhookEvent('Rejected: timestamp is invalid or outside the accepted window. id=@id, invoice=@invoice', [
+        '@id' => $eventId,
+        '@invoice' => $invoice,
+      ], 'warning');
+      return new Response('', 400);
+    }
+
+    // One process per order. If the lock is taken (onReturn() or another
+    // webhook is working on the order) do not wait: ask Frisbii to retry.
+    $orderPart = (string) $invoice;
+    if (($pos = strpos($orderPart, '-')) !== FALSE) {
+      $orderPart = substr($orderPart, 0, $pos);
+    }
+    $lockName = self::orderLockName($orderPart);
+    if (!$this->lock->acquire($lockName, self::ORDER_LOCK_TIMEOUT)) {
+      $this->reepayService->logWebhookEvent('Deferred: order for invoice=@invoice is being processed by another request. id=@id', [
+        '@invoice' => $invoice,
+        '@id' => $eventId,
+      ]);
+      return new Response('', 503, ['Retry-After' => (string) self::NOTIFY_RETRY_AFTER]);
+    }
+
+    try {
+      $response = $this->processNotification($decoded_result, $eventTime);
+    }
+    finally {
+      $this->lock->release($lockName);
+    }
+
+    // A deferred event (503) must stay open so Frisbii's retry is handled.
+    if ($response->getStatusCode() !== 503) {
+      $this->reepayService->markWebhookEventProcessed($eventId);
+    }
+
+    return $response;
+  }
+
+  /**
+   * Handles a webhook whose signature, id and timestamp are already checked.
+   *
+   * Never waits: the order state decides at once whether to act, skip, or ask
+   * Frisbii to send the event again later.
+   *
+   * @param array $data
+   *   The decoded, verified webhook payload.
+   * @param int $eventTime
+   *   The event timestamp as a Unix time.
+   */
+  private function processNotification(array $data, int $eventTime): Response {
+    $eventType = $data['event_type'];
+    $eventId = $data['id'];
+    $invoice = $data['invoice'];
+    $mode = $this->configuration['mode'] ?? 'test';
+
     if (!in_array($eventType, self::NOTIFY_EVENT_TYPES, TRUE)) {
       $this->reepayService->logWebhookEvent('Skipped: event_type=@event_type is not handled. id=@id, invoice=@invoice', [
         '@event_type' => $eventType,
@@ -276,10 +443,6 @@ abstract class ReepayGatewayBase extends OffsitePaymentGatewayBase implements Su
       ]);
       return new Response();
     }
-
-    // Only a verified, handled event reaches this point. The delay lets
-    // onReturn() place the order first; unauthenticated requests never wait.
-    $this->sleepBeforeNotifyProcessing();
 
     $invoice_handle = $invoice;
 
@@ -299,6 +462,17 @@ abstract class ReepayGatewayBase extends OffsitePaymentGatewayBase implements Su
         '@invoice' => $invoice,
       ]);
       return new Response();
+    }
+
+    // The order is still a draft. If the event is brand new, the customer is
+    // most likely coming back to the shop right now and onReturn() places the
+    // order. Ask Frisbii to send the event again instead of waiting here.
+    if ($this->time->getRequestTime() - $eventTime < self::NOTIFY_RETURN_GRACE) {
+      $this->reepayService->logWebhookEvent('Deferred: order_id=@order_id (invoice=@invoice) is still a draft and the event is new. Frisbii will send it again.', [
+        '@order_id' => $order->id(),
+        '@invoice' => $invoice,
+      ]);
+      return new Response('', 503, ['Retry-After' => (string) self::NOTIFY_RETRY_AFTER]);
     }
 
     // Fail closed: confirm payment with Frisbii before the order is placed.
@@ -329,7 +503,15 @@ abstract class ReepayGatewayBase extends OffsitePaymentGatewayBase implements Su
     $payment = $this->selectPayment($payments);
 
     $invoiceData = $this->reepayService->getInvoice($invoice);
-    $invoiceState = is_array($invoiceData) ? ($invoiceData['state'] ?? NULL) : NULL;
+    if (!is_array($invoiceData)) {
+      // Timeout or API error: we do not know the state. Ask Frisbii to send
+      // the event again; it must not be remembered as processed.
+      $this->reepayService->logWebhookEvent('Deferred: could not read invoice=@invoice from Frisbii. Frisbii will send the event again.', [
+        '@invoice' => $invoice,
+      ], 'warning');
+      return new Response('', 503, ['Retry-After' => (string) self::NOTIFY_RETRY_AFTER]);
+    }
+    $invoiceState = $invoiceData['state'] ?? NULL;
     if (!in_array($invoiceState, ['settled', 'authorized'], TRUE)) {
       $this->reepayService->logWebhookEvent('Stopped: invoice=@invoice is not authorized/settled (state=@state). Order not placed.', [
         '@invoice' => $invoice,
@@ -458,11 +640,24 @@ abstract class ReepayGatewayBase extends OffsitePaymentGatewayBase implements Su
   }
 
   /**
-   * Wraps the notify-processing delay so tests can bypass it.
+   * Converts a Frisbii webhook timestamp to a Unix time.
+   *
+   * Frisbii sends ISO 8601 in UTC, for example 2025-11-11T13:19:18.99Z. A
+   * plain Unix time is accepted too. Anything else returns NULL.
    */
-  protected function sleepBeforeNotifyProcessing(): void {
-    // waiting for onReturn to place an order first
-    sleep(15);
+  private static function parseEventTimestamp(string $timestamp): ?int {
+    if (ctype_digit($timestamp)) {
+      return (int) $timestamp;
+    }
+    if (!preg_match('/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$/', $timestamp)) {
+      return NULL;
+    }
+    try {
+      return (new \DateTimeImmutable($timestamp))->getTimestamp();
+    }
+    catch (\Exception $e) {
+      return NULL;
+    }
   }
 
   /**
@@ -525,10 +720,6 @@ abstract class ReepayGatewayBase extends OffsitePaymentGatewayBase implements Su
     return hash_equals($expected, (string) $data['signature']);
   }
 
-  public function test() {
-    echo $this->getNotifyUrl()->toString();
-  }
-
   public function submitConfigurationForm(array &$form, FormStateInterface $form_state)
   {
     parent::submitConfigurationForm($form, $form_state);
@@ -587,6 +778,8 @@ abstract class ReepayGatewayBase extends OffsitePaymentGatewayBase implements Su
 
   public function capturePayment(PaymentInterface $payment, ?Price $amount = NULL)
   {
+    $this->assertPaymentState($payment, ['authorization']);
+    $amount = $amount ?: $payment->getAmount();
     $paymentAmount = ReepayService::toMinorUnitsFor($amount, $this->entityTypeManager);
     $configuration = $payment->getPaymentGateway()->getPlugin()->getConfiguration();
 

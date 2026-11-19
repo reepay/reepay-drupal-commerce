@@ -28,6 +28,27 @@ class ReepayService
   const WEBHOOK_SECRET_CACHE_ID_PREFIX = 'commerce_reepay_checkout:webhook_secret:';
 
   /**
+   * The cache ID prefix used to remember handled webhook event ids.
+   */
+  const WEBHOOK_EVENT_CACHE_ID_PREFIX = 'commerce_reepay_checkout:webhook_event:';
+
+  /**
+   * How long a handled event id is remembered, in seconds.
+   *
+   * Frisbii retries for up to three days; one hour of slack on top.
+   */
+  const WEBHOOK_EVENT_CACHE_TTL = 262800;
+
+  /**
+   * Seconds to wait for a Frisbii API answer, and to open the connection.
+   *
+   * Without a limit a slow Frisbii API holds a PHP worker for as long as it
+   * likes. Only used when no client is injected.
+   */
+  const HTTP_TIMEOUT = 15;
+  const HTTP_CONNECT_TIMEOUT = 5;
+
+  /**
    * How long to wait between forced refreshes of the webhook secret that
    * were triggered by a signature mismatch, in seconds.
    *
@@ -74,7 +95,7 @@ class ReepayService
       $this->logger = $loggerChannelFactory->get('commerce_reepay_checkout');
       $this->cache = $cache;
       $this->time = $time;
-      $this->client = $client ?: new Client();
+      $this->client = $client ?: new Client(['timeout' => self::HTTP_TIMEOUT, 'connect_timeout' => self::HTTP_CONNECT_TIMEOUT]);
       $this->payload['headers'] = [
         'Accept' => 'application/json',
         'Content-Type' => 'application/json'
@@ -179,7 +200,7 @@ class ReepayService
   public function getInvoice($handle)
   {
        try {
-           $result = $this->client->get("https://api.reepay.com/v1/invoice/{$handle}", $this->payload);
+           $result = $this->client->get('https://api.reepay.com/v1/invoice/' . rawurlencode((string) $handle), $this->payload);
            return Json::decode($result->getBody());
        } catch(\Exception $e) {
            $this->logger->error('Get invoice @handle failed: @message', [
@@ -199,7 +220,7 @@ class ReepayService
   {
     try {
       $this->payload['body'] = Json::encode(['amount' => $amount]);
-      $this->client->post("https://api.reepay.com/v1/charge/{$invoice}/settle", $this->payload);
+      $this->client->post('https://api.reepay.com/v1/charge/' . rawurlencode($invoice) . '/settle', $this->payload);
       return ['result' => 'success'];
     } catch (\Exception $e) {
       return ['result'=>'error', 'message' => $e->getMessage()];
@@ -218,7 +239,7 @@ class ReepayService
          $this->client->post('https://api.reepay.com/v1/refund', $this->payload);
          return ['result' => 'success'];
     } catch(\Exception $e) {
-         return ['resul' => 'error', 'message' => $e->getMessage()];
+         return ['result' => 'error', 'message' => $e->getMessage()];
     }
 
   }
@@ -259,6 +280,24 @@ class ReepayService
     $this->cache->set($cacheId, $result_decoded['secret'], $this->time->getRequestTime() + self::WEBHOOK_SECRET_CACHE_TTL);
 
     return $result_decoded['secret'];
+  }
+
+  /**
+   * Tells whether a webhook event id was already handled.
+   */
+  public function isWebhookEventProcessed(string $eventId): bool
+  {
+    return (bool) $this->cache->get(self::WEBHOOK_EVENT_CACHE_ID_PREFIX . $eventId);
+  }
+
+  /**
+   * Remembers a handled webhook event id, so a replay does nothing.
+   *
+   * Kept for the full time Frisbii may retry an event.
+   */
+  public function markWebhookEventProcessed(string $eventId): void
+  {
+    $this->cache->set(self::WEBHOOK_EVENT_CACHE_ID_PREFIX . $eventId, TRUE, $this->time->getRequestTime() + self::WEBHOOK_EVENT_CACHE_TTL);
   }
 
   /**
@@ -369,10 +408,10 @@ class ReepayService
   public function void(string $invoice)
   {
     try {
-        $this->client->post('https://api.reepay.com/v1/charge/' . $invoice . '/cancel', $this->payload);
+        $this->client->post('https://api.reepay.com/v1/charge/' . rawurlencode($invoice) . '/cancel', $this->payload);
         return ['result' => 'success'];
     } catch(\Exception $e) {
-        return ['resul' => 'error', 'message' => $e->getMessage()];
+        return ['result' => 'error', 'message' => $e->getMessage()];
     }
   }
 }
