@@ -13,7 +13,11 @@ use Drupal\Core\Entity\EntityTypeManagerInterface;
 use Drupal\Core\Logger\LoggerChannelFactoryInterface;
 use Drupal\Core\Logger\LoggerChannelInterface;
 use Drupal\Tests\UnitTestCase;
+use GuzzleHttp\Client;
 use GuzzleHttp\ClientInterface;
+use GuzzleHttp\Handler\MockHandler;
+use GuzzleHttp\HandlerStack;
+use GuzzleHttp\Middleware;
 use GuzzleHttp\Exception\ConnectException;
 use GuzzleHttp\Psr7\Request as GuzzleRequest;
 use GuzzleHttp\Psr7\Response as GuzzleResponse;
@@ -289,6 +293,71 @@ class ReepayServiceTest extends UnitTestCase {
 
     $this->expectException(PaymentGatewayException::class);
     ReepayService::toMinorUnitsFor(new Price('39.00', 'USD'), $entityTypeManager);
+  }
+
+  /**
+   * A real Guzzle client with a mock handler, recording the requests sent.
+   */
+  private function recordingClient(array $responses, array &$history): Client {
+    $stack = HandlerStack::create(new MockHandler($responses));
+    $stack->push(Middleware::history($history));
+    return new Client(['handler' => $stack]);
+  }
+
+  public function testInvoiceHandleIsEncodedInEveryApiUrl(): void {
+    $handle = '5-/../../account/webhook_settings?x=1#y';
+    $encoded = rawurlencode($handle);
+    $history = [];
+    $client = $this->recordingClient([
+      new GuzzleResponse(200, [], '{}'),
+      new GuzzleResponse(200, [], '{}'),
+      new GuzzleResponse(200, [], '{}'),
+    ], $history);
+    $service = $this->createService($client, $this->createMock(CacheBackendInterface::class));
+
+    $service->getInvoice($handle);
+    $this->assertSame(['result' => 'success'], $service->settle($handle, 100));
+    $this->assertSame(['result' => 'success'], $service->void($handle));
+
+    $urls = array_map(fn($t) => (string) $t['request']->getUri(), $history);
+    $this->assertSame([
+      'https://api.reepay.com/v1/invoice/' . $encoded,
+      'https://api.reepay.com/v1/charge/' . $encoded . '/settle',
+      'https://api.reepay.com/v1/charge/' . $encoded . '/cancel',
+    ], $urls);
+    foreach ($urls as $url) {
+      $this->assertStringNotContainsString('/../', $url);
+    }
+  }
+
+  public function testFailedRefundAndVoidReturnTheResultKey(): void {
+    $history = [];
+    $client = $this->recordingClient([
+      new ConnectException('timeout', new GuzzleRequest('POST', 'x')),
+      new ConnectException('timeout', new GuzzleRequest('POST', 'x')),
+    ], $history);
+    $service = $this->createService($client, $this->createMock(CacheBackendInterface::class));
+
+    $refund = $service->refund('5', 100);
+    $void = $service->void('5');
+
+    $this->assertSame('error', $refund['result']);
+    $this->assertSame('error', $void['result']);
+    $this->assertSame('timeout', $refund['message']);
+  }
+
+  public function testDefaultHttpClientHasATimeout(): void {
+    $channel = $this->createMock(LoggerChannelInterface::class);
+    $loggerFactory = $this->createMock(LoggerChannelFactoryInterface::class);
+    $loggerFactory->method('get')->willReturn($channel);
+    $service = new ReepayService($loggerFactory, $this->createMock(CacheBackendInterface::class), $this->createMock(TimeInterface::class));
+
+    $property = new \ReflectionProperty($service, 'client');
+    $property->setAccessible(TRUE);
+    $client = $property->getValue($service);
+
+    $this->assertSame(ReepayService::HTTP_TIMEOUT, $client->getConfig('timeout'));
+    $this->assertSame(ReepayService::HTTP_CONNECT_TIMEOUT, $client->getConfig('connect_timeout'));
   }
 
 }

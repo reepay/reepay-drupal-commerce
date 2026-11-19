@@ -16,6 +16,7 @@ use Drupal\commerce_reepay_checkout\Services\ReepayService;
 use Drupal\Component\Serialization\Json;
 use Drupal\Core\Entity\EntityFormInterface;
 use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\Lock\LockBackendInterface;
 use Drupal\Core\Url;
 use Drupal\language\ConfigurableLanguageManagerInterface;
 use Symfony\Component\DependencyInjection\ContainerInterface;
@@ -50,6 +51,23 @@ abstract class ReepayGatewayBase extends OffsitePaymentGatewayBase implements Su
   private $eventDispatcher;
 
   /**
+   * Lock service, used so only one process handles an order at a time.
+   *
+   * @var \Drupal\Core\Lock\LockBackendInterface
+   */
+  protected $lock;
+
+  /**
+   * Seconds a process may hold the lock of one order.
+   */
+  private const ORDER_LOCK_TIMEOUT = 30.0;
+
+  /**
+   * Seconds onReturn() waits for a lock that onNotify() holds.
+   */
+  private const ORDER_LOCK_WAIT = 10;
+
+  /**
    * The Frisbii API payment method value(s) this gateway sends.
    *
    * @return string[]
@@ -64,6 +82,7 @@ abstract class ReepayGatewayBase extends OffsitePaymentGatewayBase implements Su
     $instance = parent::create($container, $configuration, $plugin_id, $plugin_definition);
     $instance->reepayService = $container->get('commerce_reepay_checkout.reepay_service');
     $instance->eventDispatcher = $container->get('event_dispatcher');
+    $instance->lock = $container->get('lock');
 
     return $instance;
   }
@@ -142,6 +161,15 @@ abstract class ReepayGatewayBase extends OffsitePaymentGatewayBase implements Su
          $orderHandle =  substr($orderHandle, 0, $pos);
     }
 
+    // The handle goes into Frisbii API URLs, so only plain characters are
+    // accepted (an order id, or an order id with a suffix after a dash).
+    if (!self::isValidInvoiceHandle($invoiceHandle)) {
+      $this->reepayService->logWebhookEvent('Return rejected: invoice handle has invalid characters. order_id=@order_id', [
+        '@order_id' => $order->id(),
+      ], 'warning');
+      throw new PaymentGatewayException('The invoice does not belong to this order.');
+    }
+
     // The invoice must belong to the order that is being checked out.
     if ($orderHandle === '' || $orderHandle !== (string) $order->id()) {
       $this->reepayService->logWebhookEvent('Return rejected: invoice=@invoice does not match order_id=@order_id.', [
@@ -151,6 +179,47 @@ abstract class ReepayGatewayBase extends OffsitePaymentGatewayBase implements Su
       throw new PaymentGatewayException('The invoice does not belong to this order.');
     }
 
+    // Only one process may confirm this order's payment at a time. If
+    // onNotify() holds the lock it is short, so wait for it a little.
+    $lockName = self::orderLockName((string) $order->id());
+    if (!$this->lock->acquire($lockName, self::ORDER_LOCK_TIMEOUT)) {
+      $this->lock->wait($lockName, self::ORDER_LOCK_WAIT);
+      if (!$this->lock->acquire($lockName, self::ORDER_LOCK_TIMEOUT)) {
+        $this->reepayService->logWebhookEvent('Return rejected: order_id=@order_id is being processed by another request.', [
+          '@order_id' => $order->id(),
+        ], 'warning');
+        throw new PaymentGatewayException('The order is being processed. Please try again.');
+      }
+    }
+
+    try {
+      $this->confirmReturnedPayment($order, $invoiceHandle, $orderHandle);
+    }
+    finally {
+      $this->lock->release($lockName);
+    }
+  }
+
+  /**
+   * Name of the lock that serialises work on one order.
+   */
+  private static function orderLockName(string $orderId): string {
+    return 'commerce_reepay_checkout:order:' . $orderId;
+  }
+
+  /**
+   * Whether an invoice handle only has characters that are safe in a URL.
+   */
+  private static function isValidInvoiceHandle(string $handle): bool {
+    return (bool) preg_match('/^[A-Za-z0-9_-]+$/', $handle);
+  }
+
+  /**
+   * Confirms with Frisbii that the returned payment is paid, and saves it.
+   *
+   * Runs while the order lock is held (see onReturn()).
+   */
+  private function confirmReturnedPayment(OrderInterface $order, string $invoiceHandle, string $orderHandle): void {
     $gatewayId = $this->currentGatewayId();
     if ($gatewayId === NULL) {
       $this->reepayService->logWebhookEvent('Return rejected: could not determine the payment gateway for order_id=@order_id.', [
@@ -316,7 +385,27 @@ abstract class ReepayGatewayBase extends OffsitePaymentGatewayBase implements Su
       return new Response('', 400);
     }
 
-    $response = $this->processNotification($decoded_result, $eventTime);
+    // One process per order. If the lock is taken (onReturn() or another
+    // webhook is working on the order) do not wait: ask Frisbii to retry.
+    $orderPart = (string) $invoice;
+    if (($pos = strpos($orderPart, '-')) !== FALSE) {
+      $orderPart = substr($orderPart, 0, $pos);
+    }
+    $lockName = self::orderLockName($orderPart);
+    if (!$this->lock->acquire($lockName, self::ORDER_LOCK_TIMEOUT)) {
+      $this->reepayService->logWebhookEvent('Deferred: order for invoice=@invoice is being processed by another request. id=@id', [
+        '@invoice' => $invoice,
+        '@id' => $eventId,
+      ]);
+      return new Response('', 503, ['Retry-After' => (string) self::NOTIFY_RETRY_AFTER]);
+    }
+
+    try {
+      $response = $this->processNotification($decoded_result, $eventTime);
+    }
+    finally {
+      $this->lock->release($lockName);
+    }
 
     // A deferred event (503) must stay open so Frisbii's retry is handled.
     if ($response->getStatusCode() !== 503) {
@@ -620,10 +709,6 @@ abstract class ReepayGatewayBase extends OffsitePaymentGatewayBase implements Su
     return hash_equals($expected, (string) $data['signature']);
   }
 
-  public function test() {
-    echo $this->getNotifyUrl()->toString();
-  }
-
   public function submitConfigurationForm(array &$form, FormStateInterface $form_state)
   {
     parent::submitConfigurationForm($form, $form_state);
@@ -682,6 +767,8 @@ abstract class ReepayGatewayBase extends OffsitePaymentGatewayBase implements Su
 
   public function capturePayment(PaymentInterface $payment, ?Price $amount = NULL)
   {
+    $this->assertPaymentState($payment, ['authorization']);
+    $amount = $amount ?: $payment->getAmount();
     $paymentAmount = ReepayService::toMinorUnitsFor($amount, $this->entityTypeManager);
     $configuration = $payment->getPaymentGateway()->getPlugin()->getConfiguration();
 

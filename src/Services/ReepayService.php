@@ -40,6 +40,15 @@ class ReepayService
   const WEBHOOK_EVENT_CACHE_TTL = 262800;
 
   /**
+   * Seconds to wait for a Frisbii API answer, and to open the connection.
+   *
+   * Without a limit a slow Frisbii API holds a PHP worker for as long as it
+   * likes. Only used when no client is injected.
+   */
+  const HTTP_TIMEOUT = 15;
+  const HTTP_CONNECT_TIMEOUT = 5;
+
+  /**
    * How long to wait between forced refreshes of the webhook secret that
    * were triggered by a signature mismatch, in seconds.
    *
@@ -86,7 +95,7 @@ class ReepayService
       $this->logger = $loggerChannelFactory->get('commerce_reepay_checkout');
       $this->cache = $cache;
       $this->time = $time;
-      $this->client = $client ?: new Client();
+      $this->client = $client ?: new Client(['timeout' => self::HTTP_TIMEOUT, 'connect_timeout' => self::HTTP_CONNECT_TIMEOUT]);
       $this->payload['headers'] = [
         'Accept' => 'application/json',
         'Content-Type' => 'application/json'
@@ -191,7 +200,7 @@ class ReepayService
   public function getInvoice($handle)
   {
        try {
-           $result = $this->client->get("https://api.reepay.com/v1/invoice/{$handle}", $this->payload);
+           $result = $this->client->get('https://api.reepay.com/v1/invoice/' . rawurlencode((string) $handle), $this->payload);
            return Json::decode($result->getBody());
        } catch(\Exception $e) {
            $this->logger->error('Get invoice @handle failed: @message', [
@@ -211,7 +220,7 @@ class ReepayService
   {
     try {
       $this->payload['body'] = Json::encode(['amount' => $amount]);
-      $this->client->post("https://api.reepay.com/v1/charge/{$invoice}/settle", $this->payload);
+      $this->client->post('https://api.reepay.com/v1/charge/' . rawurlencode($invoice) . '/settle', $this->payload);
       return ['result' => 'success'];
     } catch (\Exception $e) {
       return ['result'=>'error', 'message' => $e->getMessage()];
@@ -230,7 +239,7 @@ class ReepayService
          $this->client->post('https://api.reepay.com/v1/refund', $this->payload);
          return ['result' => 'success'];
     } catch(\Exception $e) {
-         return ['resul' => 'error', 'message' => $e->getMessage()];
+         return ['result' => 'error', 'message' => $e->getMessage()];
     }
 
   }
@@ -399,10 +408,10 @@ class ReepayService
   public function void(string $invoice)
   {
     try {
-        $this->client->post('https://api.reepay.com/v1/charge/' . $invoice . '/cancel', $this->payload);
+        $this->client->post('https://api.reepay.com/v1/charge/' . rawurlencode($invoice) . '/cancel', $this->payload);
         return ['result' => 'success'];
     } catch(\Exception $e) {
-        return ['resul' => 'error', 'message' => $e->getMessage()];
+        return ['result' => 'error', 'message' => $e->getMessage()];
     }
   }
 }

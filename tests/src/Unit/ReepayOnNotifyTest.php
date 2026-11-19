@@ -5,6 +5,8 @@ namespace Drupal\Tests\commerce_reepay_checkout\Unit;
 use Drupal\commerce_order\Entity\OrderInterface;
 use Drupal\commerce_payment\Entity\PaymentGatewayInterface;
 use Drupal\commerce_payment\Entity\PaymentInterface;
+use Drupal\commerce_payment\Exception\PaymentGatewayException;
+use Drupal\commerce_payment\Plugin\Commerce\PaymentGateway\PaymentGatewayInterface as PaymentGatewayPluginInterface;
 use Drupal\commerce_price\Entity\CurrencyInterface;
 use Drupal\commerce_price\Price;
 use Drupal\commerce_reepay_checkout\Plugin\Commerce\PaymentGateway\ReepayGatewayBase;
@@ -12,6 +14,7 @@ use Drupal\commerce_reepay_checkout\Services\ReepayService;
 use Drupal\Component\Datetime\TimeInterface;
 use Drupal\Core\Entity\EntityStorageInterface;
 use Drupal\Core\Entity\EntityTypeManagerInterface;
+use Drupal\Core\Lock\LockBackendInterface;
 use Drupal\Tests\UnitTestCase;
 use Drupal\state_machine\Plugin\Field\FieldType\StateItemInterface;
 use Drupal\state_machine\Plugin\Workflow\WorkflowInterface;
@@ -63,6 +66,9 @@ class ReepayOnNotifyTest extends UnitTestCase {
     $this->setInaccessibleProperty($gateway, 'entityTypeManager', $entityTypeManager ?? $this->createMock(EntityTypeManagerInterface::class));
     $this->setInaccessibleProperty($gateway, 'eventDispatcher', $eventDispatcher ?? $this->createMock(EventDispatcherInterface::class));
     $this->setInaccessibleProperty($gateway, 'time', $time);
+    $lock = $this->createMock(LockBackendInterface::class);
+    $lock->method('acquire')->willReturn(TRUE);
+    $this->setInaccessibleProperty($gateway, 'lock', $lock);
 
     // Leaving $gatewayId NULL mimics the one call path where parentEntity
     // is genuinely unavailable (see buildNotifyUrlFromFormState()'s
@@ -782,6 +788,107 @@ class ReepayOnNotifyTest extends UnitTestCase {
     $response = $gateway->onNotify($this->request($this->signedPayloadAt('1699999880')));
 
     $this->assertSame(200, $response->getStatusCode());
+  }
+
+  /**
+   * FD-15: when the order lock is taken the webhook is deferred, not run.
+   */
+  public function testWebhookIsDeferredWhileTheOrderLockIsTaken(): void {
+    [$gateway, $reepayService] = $this->notifyGatewayForUnplacedOrder(NULL, TRUE, 17, FALSE);
+    $lock = $this->createMock(LockBackendInterface::class);
+    $lock->expects($this->once())->method('acquire')->with('commerce_reepay_checkout:order:17')->willReturn(FALSE);
+    $lock->expects($this->never())->method('release');
+    $this->setInaccessibleProperty($gateway, 'lock', $lock);
+    $reepayService->expects($this->never())->method('markWebhookEventProcessed');
+
+    $response = $gateway->onNotify($this->request($this->signedPayloadAt(self::EVENT_TIME)));
+
+    $this->assertSame(503, $response->getStatusCode());
+    $this->assertSame('120', $response->headers->get('Retry-After'));
+  }
+
+  /**
+   * FD-15: the order lock is always released after the webhook.
+   */
+  public function testOrderLockIsReleasedAfterTheWebhook(): void {
+    [$gateway] = $this->notifyGatewayForUnplacedOrder($this->paidInvoice(['state' => 'created']));
+    $lock = $this->createMock(LockBackendInterface::class);
+    $lock->method('acquire')->willReturn(TRUE);
+    $lock->expects($this->once())->method('release')->with('commerce_reepay_checkout:order:17');
+    $this->setInaccessibleProperty($gateway, 'lock', $lock);
+
+    $gateway->onNotify($this->request($this->signedPayloadAt(self::EVENT_TIME)));
+  }
+
+  /**
+   * FD-15: an invoice value that is not a plain handle never reaches the API.
+   */
+  #[DataProvider('badInvoiceHandleProvider')]
+  public function testReturnWithUnsafeInvoiceHandleIsRejectedBeforeAnyApiCall(string $invoice): void {
+    $reepayService = $this->createReepayServiceMock();
+    $reepayService->expects($this->never())->method('getInvoice');
+    $gateway = $this->createGateway($reepayService);
+    $order = $this->createMock(OrderInterface::class);
+    $order->method('id')->willReturn(17);
+
+    $this->expectException(PaymentGatewayException::class);
+    $gateway->onReturn($order, new Request(['invoice' => $invoice]));
+  }
+
+  public static function badInvoiceHandleProvider(): array {
+    return [
+      'dot dot segments' => ['17-/../../account/webhook_settings'],
+      'query string' => ['17-?x=1'],
+      'fragment' => ['17-#y'],
+      'percent sign' => ['17-%2F..'],
+      'space' => ['17- 5'],
+      'empty' => [''],
+    ];
+  }
+
+  private function paymentToCapture(string $state): PaymentInterface {
+    $paymentState = $this->createMock(StateItemInterface::class);
+    $paymentState->method('getId')->willReturn($state);
+    $plugin = $this->createMock(PaymentGatewayPluginInterface::class);
+    $plugin->method('getConfiguration')->willReturn(['mode' => 'test', 'test_private_key' => 'k', 'live_private_key' => 'l']);
+    $gatewayEntity = $this->createMock(PaymentGatewayInterface::class);
+    $gatewayEntity->method('getPlugin')->willReturn($plugin);
+    $payment = $this->createMock(PaymentInterface::class);
+    $payment->method('getState')->willReturn($paymentState);
+    $payment->method('getPaymentGateway')->willReturn($gatewayEntity);
+    $payment->method('getRemoteId')->willReturn('17');
+    $payment->method('getAmount')->willReturn(new Price('39.00', 'USD'));
+    return $payment;
+  }
+
+  /**
+   * FD-15: only an authorization can be captured.
+   */
+  public function testCaptureOfAPaymentThatIsNotAnAuthorizationIsRefused(): void {
+    $reepayService = $this->createReepayServiceMock();
+    $reepayService->expects($this->never())->method('settle');
+    $gateway = $this->createGateway($reepayService);
+
+    $this->expectException(\InvalidArgumentException::class);
+    $gateway->capturePayment($this->paymentToCapture('completed'), new Price('39.00', 'USD'));
+  }
+
+  /**
+   * FD-15: no amount means the full payment amount, not a PHP error.
+   */
+  public function testCaptureWithoutAmountUsesThePaymentAmount(): void {
+    $reepayService = $this->createReepayServiceMock();
+    $reepayService->expects($this->once())->method('settle')->with('17', 3900)->willReturn(['result' => 'success']);
+    $entityTypeManager = $this->createMock(EntityTypeManagerInterface::class);
+    $entityTypeManager->method('getStorage')->willReturnMap([
+      ['commerce_currency', $this->currencyStorage(NULL)],
+    ]);
+    $gateway = $this->createGateway($reepayService, $entityTypeManager);
+    $payment = $this->paymentToCapture('authorization');
+    $payment->expects($this->once())->method('setState')->with('completed');
+    $payment->expects($this->once())->method('save');
+
+    $gateway->capturePayment($payment, NULL);
   }
 
 }
