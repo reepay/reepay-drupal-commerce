@@ -416,10 +416,24 @@ class ReepayOnNotifyTest extends UnitTestCase {
     $this->assertTrue($response->isSuccessful());
   }
 
-  public function testMissingInvoiceDataDoesNotPlaceOrder(): void {
-    [$gateway] = $this->notifyGatewayForUnplacedOrder(NULL);
+  /**
+   * FD-15: a failed or slow Frisbii call is deferred (503) and the event id is
+   * not stored, so Frisbii's retry is handled.
+   */
+  public function testFailedInvoiceCallIsDeferredAndNotMarkedProcessed(): void {
+    [$gateway, $reepayService] = $this->notifyGatewayForUnplacedOrder(NULL);
+    $reepayService->expects($this->never())->method('markWebhookEventProcessed');
     $response = $gateway->onNotify($this->request($this->signedPayload()));
-    $this->assertTrue($response->isSuccessful());
+    $this->assertSame(503, $response->getStatusCode());
+    $this->assertSame('120', $response->headers->get('Retry-After'));
+  }
+
+  /**
+   * FD-15: the return waits longer than the HTTP timeout for the order lock.
+   */
+  public function testReturnLockWaitIsLongerThanTheHttpTimeout(): void {
+    $wait = (new \ReflectionClassConstant(ReepayGatewayBase::class, 'ORDER_LOCK_WAIT'))->getValue();
+    $this->assertGreaterThan(ReepayService::HTTP_TIMEOUT, $wait);
   }
 
   public function testMissingPaymentEntityDoesNotPlaceOrder(): void {

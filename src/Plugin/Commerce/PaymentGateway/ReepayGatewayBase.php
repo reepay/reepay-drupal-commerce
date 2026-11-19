@@ -64,8 +64,11 @@ abstract class ReepayGatewayBase extends OffsitePaymentGatewayBase implements Su
 
   /**
    * Seconds onReturn() waits for a lock that onNotify() holds.
+   *
+   * Longer than the HTTP timeout, because onNotify() holds the lock while it
+   * asks Frisbii for the invoice (one call, at most HTTP_TIMEOUT seconds).
    */
-  private const ORDER_LOCK_WAIT = 10;
+  private const ORDER_LOCK_WAIT = ReepayService::HTTP_TIMEOUT + 5;
 
   /**
    * The Frisbii API payment method value(s) this gateway sends.
@@ -500,7 +503,15 @@ abstract class ReepayGatewayBase extends OffsitePaymentGatewayBase implements Su
     $payment = $this->selectPayment($payments);
 
     $invoiceData = $this->reepayService->getInvoice($invoice);
-    $invoiceState = is_array($invoiceData) ? ($invoiceData['state'] ?? NULL) : NULL;
+    if (!is_array($invoiceData)) {
+      // Timeout or API error: we do not know the state. Ask Frisbii to send
+      // the event again; it must not be remembered as processed.
+      $this->reepayService->logWebhookEvent('Deferred: could not read invoice=@invoice from Frisbii. Frisbii will send the event again.', [
+        '@invoice' => $invoice,
+      ], 'warning');
+      return new Response('', 503, ['Retry-After' => (string) self::NOTIFY_RETRY_AFTER]);
+    }
+    $invoiceState = $invoiceData['state'] ?? NULL;
     if (!in_array($invoiceState, ['settled', 'authorized'], TRUE)) {
       $this->reepayService->logWebhookEvent('Stopped: invoice=@invoice is not authorized/settled (state=@state). Order not placed.', [
         '@invoice' => $invoice,
